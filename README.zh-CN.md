@@ -141,6 +141,8 @@ dsview-cli capture \
 - `capture.vcd` - Value Change Dump 格式的波形数据。
 - `capture.json` - 元数据 sidecar，包含采集配置、完成状态和产物路径。
 
+如需输出可直接用官方 DSView GUI 打开的 `.dsl` 会话归档，可传入 `--output capture.dsl`、单独使用 `--dsl-output capture.dsl`，或同时传入 `--output capture.vcd --dsl-output capture.dsl`。
+
 采集选项 override 使用 `devices options` 报告的 token：
 
 ```bash
@@ -309,7 +311,7 @@ dsview-cli devices options --handle HANDLE [--format json|text] [--resource-dir 
 
 ### `capture`
 
-执行有限长度采集并导出 VCD 文件。
+执行有限长度采集并导出 `.vcd` 和/或 `.dsl` 文件。
 
 ```bash
 dsview-cli capture \
@@ -317,7 +319,8 @@ dsview-cli capture \
   --sample-rate-hz HZ \
   --sample-limit SAMPLES \
   --channels IDX[,IDX...] \
-  --output PATH.vcd \
+  [--output PATH.vcd|PATH.dsl] \
+  [--dsl-output PATH.dsl] \
   [--metadata-output PATH.json] \
   [--operation-mode TOKEN] \
   [--stop-option TOKEN] \

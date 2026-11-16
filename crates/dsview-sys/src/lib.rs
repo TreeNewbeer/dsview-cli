@@ -140,6 +140,55 @@ unsafe extern "C" {
         out_buffer: *mut RawExportBuffer,
     ) -> c_int;
     fn dsview_bridge_free_export_buffer(buffer: *mut RawExportBuffer);
+    fn dsview_bridge_ds_recorded_stream_sample_count(out_sample_count: *mut u64) -> c_int;
+    fn dsview_bridge_ds_export_recorded_dsl(
+        request: *const RawDslExportRequest,
+        path: *const c_char,
+        out_facts: *mut RawStreamExportFacts,
+    ) -> c_int;
+    fn dsview_bridge_ds_begin_streaming_dsl(
+        samplerate_hz: u64,
+        enabled_channels: *const u16,
+        enabled_channel_count: usize,
+        path: *const c_char,
+    ) -> c_int;
+    fn dsview_bridge_ds_get_streaming_dsl_progress(
+        out_progress: *mut RawDslStreamProgress,
+    ) -> c_int;
+    fn dsview_bridge_ds_finish_streaming_dsl(
+        request: *const RawDslExportRequest,
+        out_facts: *mut RawStreamExportFacts,
+    ) -> c_int;
+    fn dsview_bridge_ds_abort_streaming_dsl();
+    fn dsview_bridge_render_dsl_from_samples(
+        request: *const RawDslExportRequest,
+        sample_bytes: *const u8,
+        sample_bytes_len: usize,
+        unitsize: u16,
+        path: *const c_char,
+        out_facts: *mut RawStreamExportFacts,
+    ) -> c_int;
+    fn dsview_bridge_render_dsl_from_logic_packets(
+        request: *const RawDslExportRequest,
+        sample_bytes: *const u8,
+        sample_bytes_len: usize,
+        logic_packet_lengths: *const usize,
+        logic_packet_count: usize,
+        unitsize: u16,
+        path: *const c_char,
+        out_facts: *mut RawStreamExportFacts,
+    ) -> c_int;
+    fn dsview_bridge_render_dsl_from_cross_logic_packets(
+        request: *const RawDslExportRequest,
+        sample_bytes: *const u8,
+        sample_bytes_len: usize,
+        logic_packet_lengths: *const usize,
+        logic_packet_count: usize,
+        path: *const c_char,
+        out_facts: *mut RawStreamExportFacts,
+    ) -> c_int;
+    fn dsview_bridge_ds_device_from_file(file_path: *const c_char) -> c_int;
+    fn dsview_bridge_ds_remove_device(handle: u64) -> c_int;
     fn dsview_decode_runtime_load(path: *const c_char) -> c_int;
     fn dsview_decode_runtime_init(decoder_dir: *const c_char) -> c_int;
     fn dsview_decode_runtime_exit() -> c_int;
@@ -372,6 +421,38 @@ struct RawStreamExportFacts {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct RawDslChannelSpec {
+    index: u16,
+    name: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawDslExportRequest {
+    samplerate_hz: u64,
+    channels: *const RawDslChannelSpec,
+    channel_count: usize,
+    driver_name: *const c_char,
+    trigger_time_ms: i64,
+    trigger_pos: u64,
+    session_json: *const c_char,
+    decoders_json: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawDslStreamProgress {
+    sample_count: u64,
+    packet_count: usize,
+    block_count: usize,
+    saw_logic_packet: c_int,
+    saw_end_packet: c_int,
+    end_packet_status: c_int,
+    status: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RawDecodeChannel {
     id: *mut c_char,
     name: *mut c_char,
@@ -562,6 +643,37 @@ pub struct VcdExportFacts {
     pub sample_count: u64,
     pub packet_count: usize,
     pub output_bytes: u64,
+}
+
+/// Channel index and display label stored inside a `DSView` `.dsl` archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DslChannelSpec {
+    pub index: u16,
+    pub name: String,
+}
+
+/// Metadata and configuration payload for exporting a `DSView` `.dsl` session archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DslExportRequest {
+    pub samplerate_hz: u64,
+    pub channels: Vec<DslChannelSpec>,
+    pub driver_name: String,
+    pub trigger_time_ms: i64,
+    pub trigger_pos: u64,
+    pub session_json: String,
+    pub decoders_json: String,
+}
+
+/// Progress snapshot reported by the active streaming `.dsl` archive writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DslStreamProgress {
+    pub sample_count: u64,
+    pub packet_count: usize,
+    pub block_count: usize,
+    pub saw_logic_packet: bool,
+    pub saw_end_packet: bool,
+    pub end_packet_status: i32,
+    pub status: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2029,40 +2141,7 @@ impl RuntimeBridge {
         logic_packet_lengths: &[usize],
         unitsize: u16,
     ) -> Result<VcdExport, RuntimeError> {
-        if sample_bytes.is_empty() {
-            return Err(RuntimeError::InvalidArgument(
-                "sample bytes must not be empty".to_string(),
-            ));
-        }
-        if logic_packet_lengths.is_empty() {
-            return Err(RuntimeError::InvalidArgument(
-                "at least one logic packet is required".to_string(),
-            ));
-        }
-        if unitsize == 0 {
-            return Err(RuntimeError::InvalidArgument(
-                "logic packet unitsize must be greater than zero".to_string(),
-            ));
-        }
-        if (sample_bytes.len() % unitsize as usize) != 0 {
-            return Err(RuntimeError::InvalidArgument(
-                "sample bytes length must divide evenly by unitsize".to_string(),
-            ));
-        }
-        let expected_total: usize = logic_packet_lengths.iter().sum();
-        if expected_total != sample_bytes.len() {
-            return Err(RuntimeError::InvalidArgument(
-                "logic packet lengths must sum to the sample byte length".to_string(),
-            ));
-        }
-        if logic_packet_lengths
-            .iter()
-            .any(|length| *length == 0 || (length % unitsize as usize) != 0)
-        {
-            return Err(RuntimeError::InvalidArgument(
-                "each logic packet length must be non-zero and aligned to unitsize".to_string(),
-            ));
-        }
+        validate_logic_packet_inputs(sample_bytes, logic_packet_lengths, unitsize)?;
 
         let raw_request = raw_vcd_export_request(request)?;
         let mut raw = RawExportBuffer {
@@ -2091,44 +2170,11 @@ impl RuntimeBridge {
         sample_bytes: &[u8],
         logic_packet_lengths: &[usize],
     ) -> Result<VcdExport, RuntimeError> {
-        if sample_bytes.is_empty() {
-            return Err(RuntimeError::InvalidArgument(
-                "sample bytes must not be empty".to_string(),
-            ));
-        }
-        if logic_packet_lengths.is_empty() {
-            return Err(RuntimeError::InvalidArgument(
-                "at least one logic packet is required".to_string(),
-            ));
-        }
-        if request.enabled_channels.is_empty() {
-            return Err(RuntimeError::InvalidArgument(
-                "at least one enabled channel is required for cross-logic export".to_string(),
-            ));
-        }
-
-        let cross_unitsize = request.enabled_channels.len() * std::mem::size_of::<u64>();
-        if (sample_bytes.len() % cross_unitsize) != 0 {
-            return Err(RuntimeError::InvalidArgument(
-                "cross-logic sample bytes length must divide evenly by enabled_channel_count * 8"
-                    .to_string(),
-            ));
-        }
-        let expected_total: usize = logic_packet_lengths.iter().sum();
-        if expected_total != sample_bytes.len() {
-            return Err(RuntimeError::InvalidArgument(
-                "logic packet lengths must sum to the sample byte length".to_string(),
-            ));
-        }
-        if logic_packet_lengths
-            .iter()
-            .any(|length| *length == 0 || (length % cross_unitsize) != 0)
-        {
-            return Err(RuntimeError::InvalidArgument(
-                "each cross-logic packet length must be non-zero and aligned to enabled_channel_count * 8"
-                    .to_string(),
-            ));
-        }
+        validate_cross_logic_packet_inputs(
+            request.enabled_channels.len(),
+            sample_bytes,
+            logic_packet_lengths,
+        )?;
 
         let raw_request = raw_vcd_export_request(request)?;
         let mut raw = RawExportBuffer {
@@ -2169,6 +2215,223 @@ impl RuntimeBridge {
             sample_count: export.sample_count,
             packet_count: export.packet_count,
             output_bytes: export.bytes.len() as u64,
+        })
+    }
+
+    /// Return the total logic sample count retained in the current recorded stream.
+    pub fn recorded_stream_sample_count(&self) -> Result<u64, RuntimeError> {
+        let mut sample_count = 0_u64;
+        export_call_status("ds_recorded_stream_sample_count", unsafe {
+            dsview_bridge_ds_recorded_stream_sample_count(&mut sample_count)
+        })?;
+        Ok(sample_count)
+    }
+
+    /// Export the retained recorded stream to a `.dsl` archive atomically at `final_path`.
+    pub fn export_recorded_dsl_to_path(
+        &self,
+        request: &DslExportRequest,
+        final_path: impl AsRef<Path>,
+    ) -> Result<VcdExportFacts, RuntimeError> {
+        let prepared = prepare_raw_dsl_export(request)?;
+        write_dsl_via_temp_path(final_path.as_ref(), |temp_path| {
+            let c_path = path_to_cstring(temp_path)?;
+            let mut raw_facts = zero_raw_stream_export_facts();
+            export_call_status("ds_export_recorded_dsl", unsafe {
+                let raw_request = prepared.raw();
+                dsview_bridge_ds_export_recorded_dsl(&raw_request, c_path.as_ptr(), &mut raw_facts)
+            })?;
+            Ok(export_facts_from_raw(raw_facts))
+        })
+    }
+
+    /// Begin streaming incoming logic packets directly into a `.dsl` ZIP archive at `path`.
+    pub fn begin_streaming_dsl_to_path(
+        &self,
+        samplerate_hz: u64,
+        enabled_channels: &[u16],
+        path: impl AsRef<Path>,
+    ) -> Result<(), RuntimeError> {
+        if samplerate_hz == 0 {
+            return Err(RuntimeError::InvalidArgument(
+                "samplerate must be greater than zero".to_string(),
+            ));
+        }
+        if enabled_channels.is_empty() {
+            return Err(RuntimeError::InvalidArgument(
+                "at least one enabled channel is required for DSL export".to_string(),
+            ));
+        }
+        let path = path.as_ref();
+        ensure_output_parent_dir(path, "streaming DSL path")?;
+        let c_path = path_to_cstring(path)?;
+        export_call_status("ds_begin_streaming_dsl", unsafe {
+            dsview_bridge_ds_begin_streaming_dsl(
+                samplerate_hz,
+                enabled_channels.as_ptr(),
+                enabled_channels.len(),
+                c_path.as_ptr(),
+            )
+        })
+    }
+
+    /// Query the completed status and sample/block counters of the active streaming `.dsl` writer.
+    pub fn streaming_dsl_progress(&self) -> Result<DslStreamProgress, RuntimeError> {
+        let mut raw = RawDslStreamProgress {
+            sample_count: 0,
+            packet_count: 0,
+            block_count: 0,
+            saw_logic_packet: 0,
+            saw_end_packet: 0,
+            end_packet_status: -1,
+            status: 0,
+        };
+        export_call_status("ds_get_streaming_dsl_progress", unsafe {
+            dsview_bridge_ds_get_streaming_dsl_progress(&mut raw)
+        })?;
+        Ok(DslStreamProgress {
+            sample_count: raw.sample_count,
+            packet_count: raw.packet_count,
+            block_count: raw.block_count,
+            saw_logic_packet: raw.saw_logic_packet != 0,
+            saw_end_packet: raw.saw_end_packet != 0,
+            end_packet_status: raw.end_packet_status,
+            status: raw.status,
+        })
+    }
+
+    /// Finalize the active streaming `.dsl` archive by writing metadata entries and closing the ZIP.
+    pub fn finish_streaming_dsl(
+        &self,
+        request: &DslExportRequest,
+    ) -> Result<VcdExportFacts, RuntimeError> {
+        let prepared = prepare_raw_dsl_export(request)?;
+        let mut raw_facts = zero_raw_stream_export_facts();
+        export_call_status("ds_finish_streaming_dsl", unsafe {
+            let raw_request = prepared.raw();
+            dsview_bridge_ds_finish_streaming_dsl(&raw_request, &mut raw_facts)
+        })?;
+        Ok(export_facts_from_raw(raw_facts))
+    }
+
+    /// Abort and release any active streaming `.dsl` writer state.
+    pub fn abort_streaming_dsl(&self) {
+        unsafe { dsview_bridge_ds_abort_streaming_dsl() };
+    }
+
+    /// Render synthetic split logic samples into a `.dsl` archive atomically at `final_path`.
+    pub fn render_dsl_from_samples_to_path(
+        &self,
+        request: &DslExportRequest,
+        sample_bytes: &[u8],
+        unitsize: u16,
+        final_path: impl AsRef<Path>,
+    ) -> Result<VcdExportFacts, RuntimeError> {
+        if sample_bytes.is_empty() {
+            return Err(RuntimeError::InvalidArgument(
+                "sample bytes must not be empty".to_string(),
+            ));
+        }
+        if unitsize == 0 || (sample_bytes.len() % unitsize as usize) != 0 {
+            return Err(RuntimeError::InvalidArgument(
+                "sample bytes length must divide evenly by non-zero unitsize".to_string(),
+            ));
+        }
+        let prepared = prepare_raw_dsl_export(request)?;
+        write_dsl_via_temp_path(final_path.as_ref(), |temp_path| {
+            let c_path = path_to_cstring(temp_path)?;
+            let mut raw_facts = zero_raw_stream_export_facts();
+            export_call_status("render_dsl_from_samples", unsafe {
+                let raw_request = prepared.raw();
+                dsview_bridge_render_dsl_from_samples(
+                    &raw_request,
+                    sample_bytes.as_ptr(),
+                    sample_bytes.len(),
+                    unitsize,
+                    c_path.as_ptr(),
+                    &mut raw_facts,
+                )
+            })?;
+            Ok(export_facts_from_raw(raw_facts))
+        })
+    }
+
+    /// Render synthetic multi-packet split logic data into a `.dsl` archive atomically at `final_path`.
+    pub fn render_dsl_from_logic_packets_to_path(
+        &self,
+        request: &DslExportRequest,
+        sample_bytes: &[u8],
+        logic_packet_lengths: &[usize],
+        unitsize: u16,
+        final_path: impl AsRef<Path>,
+    ) -> Result<VcdExportFacts, RuntimeError> {
+        validate_logic_packet_inputs(sample_bytes, logic_packet_lengths, unitsize)?;
+        let prepared = prepare_raw_dsl_export(request)?;
+        write_dsl_via_temp_path(final_path.as_ref(), |temp_path| {
+            let c_path = path_to_cstring(temp_path)?;
+            let mut raw_facts = zero_raw_stream_export_facts();
+            export_call_status("render_dsl_from_logic_packets", unsafe {
+                let raw_request = prepared.raw();
+                dsview_bridge_render_dsl_from_logic_packets(
+                    &raw_request,
+                    sample_bytes.as_ptr(),
+                    sample_bytes.len(),
+                    logic_packet_lengths.as_ptr(),
+                    logic_packet_lengths.len(),
+                    unitsize,
+                    c_path.as_ptr(),
+                    &mut raw_facts,
+                )
+            })?;
+            Ok(export_facts_from_raw(raw_facts))
+        })
+    }
+
+    /// Render synthetic hardware `LA_CROSS_DATA` logic packets into a `.dsl` archive at `final_path`.
+    pub fn render_dsl_from_cross_logic_packets_to_path(
+        &self,
+        request: &DslExportRequest,
+        sample_bytes: &[u8],
+        logic_packet_lengths: &[usize],
+        final_path: impl AsRef<Path>,
+    ) -> Result<VcdExportFacts, RuntimeError> {
+        validate_cross_logic_packet_inputs(
+            request.channels.len(),
+            sample_bytes,
+            logic_packet_lengths,
+        )?;
+        let prepared = prepare_raw_dsl_export(request)?;
+        write_dsl_via_temp_path(final_path.as_ref(), |temp_path| {
+            let c_path = path_to_cstring(temp_path)?;
+            let mut raw_facts = zero_raw_stream_export_facts();
+            export_call_status("render_dsl_from_cross_logic_packets", unsafe {
+                let raw_request = prepared.raw();
+                dsview_bridge_render_dsl_from_cross_logic_packets(
+                    &raw_request,
+                    sample_bytes.as_ptr(),
+                    sample_bytes.len(),
+                    logic_packet_lengths.as_ptr(),
+                    logic_packet_lengths.len(),
+                    c_path.as_ptr(),
+                    &mut raw_facts,
+                )
+            })?;
+            Ok(export_facts_from_raw(raw_facts))
+        })
+    }
+
+    /// Register a `.dsl` session archive with `libsigrok4DSL` as a `virtual-session` device.
+    pub fn device_from_file(&self, path: impl AsRef<Path>) -> Result<(), RuntimeError> {
+        let c_path = path_to_cstring(path.as_ref())?;
+        native_call_status("ds_device_from_file", unsafe {
+            dsview_bridge_ds_device_from_file(c_path.as_ptr())
+        })
+    }
+
+    /// Remove and destroy a previously opened or registered device handle.
+    pub fn remove_device(&self, handle: DeviceHandle) -> Result<(), RuntimeError> {
+        native_call_status("ds_remove_device", unsafe {
+            dsview_bridge_ds_remove_device(handle.raw())
         })
     }
 
@@ -2907,41 +3170,76 @@ pub fn source_decode_runtime_library_path() -> Option<&'static Path> {
     option_env!("DSVIEW_SOURCE_DECODE_RUNTIME_LIBRARY").map(Path::new)
 }
 
-fn write_vcd_atomically(final_path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
-    let parent = final_path.parent().ok_or_else(|| {
+fn ensure_output_parent_dir(path: &Path, label: &str) -> Result<PathBuf, RuntimeError> {
+    let parent = path.parent().ok_or_else(|| {
         RuntimeError::InvalidArgument(format!(
-            "final VCD path `{}` must have a parent directory",
-            final_path.display()
+            "{label} `{}` must have a parent directory",
+            path.display()
         ))
     })?;
-    fs::create_dir_all(parent).map_err(|error| RuntimeError::TempWrite {
-        path: parent.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent).map_err(|error| RuntimeError::TempWrite {
+            path: parent.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    }
+    Ok(parent.to_path_buf())
+}
 
-    let temp_path = final_path.with_extension(format!(
-        "{}.tmp",
-        final_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("vcd")
-    ));
+fn prepare_temp_output_path(final_path: &Path, default_ext: &str) -> Result<PathBuf, RuntimeError> {
+    let label = match default_ext {
+        "dsl" => "final DSL path",
+        _ => "final VCD path",
+    };
+    ensure_output_parent_dir(final_path, label)?;
+    let ext = final_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or(default_ext);
+    Ok(final_path.with_extension(format!("{ext}.tmp")))
+}
 
-    fs::write(&temp_path, bytes).map_err(|error| RuntimeError::TempWrite {
-        path: temp_path.clone(),
-        detail: error.to_string(),
-    })?;
-
-    if let Err(error) = fs::rename(&temp_path, final_path) {
-        let _ = fs::remove_file(&temp_path);
+fn promote_temp_output_file(temp_path: &Path, final_path: &Path) -> Result<(), RuntimeError> {
+    if let Err(error) = fs::rename(temp_path, final_path) {
+        let _ = fs::remove_file(temp_path);
         return Err(RuntimeError::TempPromote {
-            from: temp_path,
+            from: temp_path.to_path_buf(),
             to: final_path.to_path_buf(),
             detail: error.to_string(),
         });
     }
-
     Ok(())
+}
+
+fn write_dsl_via_temp_path<F>(
+    final_path: &Path,
+    render_to_temp: F,
+) -> Result<VcdExportFacts, RuntimeError>
+where
+    F: FnOnce(&Path) -> Result<VcdExportFacts, RuntimeError>,
+{
+    let temp_path = prepare_temp_output_path(final_path, "dsl")?;
+    let facts = match render_to_temp(&temp_path) {
+        Ok(facts) => facts,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    promote_temp_output_file(&temp_path, final_path)?;
+    Ok(facts)
+}
+
+fn write_vcd_atomically(final_path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
+    let temp_path = prepare_temp_output_path(final_path, "vcd")?;
+    if let Err(error) = fs::write(&temp_path, bytes) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(RuntimeError::TempWrite {
+            path: temp_path,
+            detail: error.to_string(),
+        });
+    }
+    promote_temp_output_file(&temp_path, final_path)
 }
 
 fn bridge_last_error() -> String {
@@ -3514,6 +3812,180 @@ fn path_to_decode_cstring(path: &Path) -> Result<CString, DecodeRuntimeError> {
         DecodeRuntimeError::PathContainsNul {
             path: path.to_path_buf(),
         }
+    })
+}
+
+fn zero_raw_stream_export_facts() -> RawStreamExportFacts {
+    RawStreamExportFacts {
+        sample_count: 0,
+        packet_count: 0,
+        output_bytes: 0,
+    }
+}
+
+fn export_facts_from_raw(raw: RawStreamExportFacts) -> VcdExportFacts {
+    VcdExportFacts {
+        sample_count: raw.sample_count,
+        packet_count: raw.packet_count,
+        output_bytes: raw.output_bytes,
+    }
+}
+
+fn validate_logic_packet_inputs(
+    sample_bytes: &[u8],
+    logic_packet_lengths: &[usize],
+    unitsize: u16,
+) -> Result<(), RuntimeError> {
+    if sample_bytes.is_empty() {
+        return Err(RuntimeError::InvalidArgument(
+            "sample bytes must not be empty".to_string(),
+        ));
+    }
+    if logic_packet_lengths.is_empty() {
+        return Err(RuntimeError::InvalidArgument(
+            "at least one logic packet is required".to_string(),
+        ));
+    }
+    if unitsize == 0 {
+        return Err(RuntimeError::InvalidArgument(
+            "logic packet unitsize must be greater than zero".to_string(),
+        ));
+    }
+    if (sample_bytes.len() % unitsize as usize) != 0 {
+        return Err(RuntimeError::InvalidArgument(
+            "sample bytes length must divide evenly by unitsize".to_string(),
+        ));
+    }
+    let expected_total: usize = logic_packet_lengths.iter().sum();
+    if expected_total != sample_bytes.len() {
+        return Err(RuntimeError::InvalidArgument(
+            "logic packet lengths must sum to the sample byte length".to_string(),
+        ));
+    }
+    if logic_packet_lengths
+        .iter()
+        .any(|length| *length == 0 || (length % unitsize as usize) != 0)
+    {
+        return Err(RuntimeError::InvalidArgument(
+            "each logic packet length must be non-zero and aligned to unitsize".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cross_logic_packet_inputs(
+    enabled_channel_count: usize,
+    sample_bytes: &[u8],
+    logic_packet_lengths: &[usize],
+) -> Result<(), RuntimeError> {
+    if sample_bytes.is_empty() {
+        return Err(RuntimeError::InvalidArgument(
+            "sample bytes must not be empty".to_string(),
+        ));
+    }
+    if logic_packet_lengths.is_empty() {
+        return Err(RuntimeError::InvalidArgument(
+            "at least one logic packet is required".to_string(),
+        ));
+    }
+    if enabled_channel_count == 0 {
+        return Err(RuntimeError::InvalidArgument(
+            "at least one enabled channel is required for cross-logic export".to_string(),
+        ));
+    }
+
+    let cross_unitsize = enabled_channel_count * std::mem::size_of::<u64>();
+    if (sample_bytes.len() % cross_unitsize) != 0 {
+        return Err(RuntimeError::InvalidArgument(
+            "cross-logic sample bytes length must divide evenly by enabled_channel_count * 8"
+                .to_string(),
+        ));
+    }
+    let expected_total: usize = logic_packet_lengths.iter().sum();
+    if expected_total != sample_bytes.len() {
+        return Err(RuntimeError::InvalidArgument(
+            "logic packet lengths must sum to the sample byte length".to_string(),
+        ));
+    }
+    if logic_packet_lengths
+        .iter()
+        .any(|length| *length == 0 || (length % cross_unitsize) != 0)
+    {
+        return Err(RuntimeError::InvalidArgument(
+            "each cross-logic packet length must be non-zero and aligned to enabled_channel_count * 8"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct PreparedRawDslExport {
+    _channel_names: Vec<CString>,
+    raw_channels: Vec<RawDslChannelSpec>,
+    driver_name: CString,
+    session_json: CString,
+    decoders_json: CString,
+    samplerate_hz: u64,
+    trigger_time_ms: i64,
+    trigger_pos: u64,
+}
+
+impl PreparedRawDslExport {
+    fn raw(&self) -> RawDslExportRequest {
+        RawDslExportRequest {
+            samplerate_hz: self.samplerate_hz,
+            channels: self.raw_channels.as_ptr(),
+            channel_count: self.raw_channels.len(),
+            driver_name: self.driver_name.as_ptr(),
+            trigger_time_ms: self.trigger_time_ms,
+            trigger_pos: self.trigger_pos,
+            session_json: self.session_json.as_ptr(),
+            decoders_json: self.decoders_json.as_ptr(),
+        }
+    }
+}
+
+fn string_to_cstring(value: &str, label: &str) -> Result<CString, RuntimeError> {
+    CString::new(value.as_bytes()).map_err(|_| {
+        RuntimeError::InvalidArgument(format!("{label} must not contain interior NUL bytes"))
+    })
+}
+
+fn prepare_raw_dsl_export(request: &DslExportRequest) -> Result<PreparedRawDslExport, RuntimeError> {
+    if request.samplerate_hz == 0 {
+        return Err(RuntimeError::InvalidArgument(
+            "samplerate must be greater than zero".to_string(),
+        ));
+    }
+    if request.channels.is_empty() {
+        return Err(RuntimeError::InvalidArgument(
+            "at least one enabled channel is required for DSL export".to_string(),
+        ));
+    }
+
+    let mut channel_names = Vec::with_capacity(request.channels.len());
+    for channel in &request.channels {
+        channel_names.push(string_to_cstring(&channel.name, "DSL channel name")?);
+    }
+    let raw_channels = request
+        .channels
+        .iter()
+        .zip(channel_names.iter())
+        .map(|(channel, name)| RawDslChannelSpec {
+            index: channel.index,
+            name: name.as_ptr(),
+        })
+        .collect();
+
+    Ok(PreparedRawDslExport {
+        _channel_names: channel_names,
+        raw_channels,
+        driver_name: string_to_cstring(&request.driver_name, "DSL driver name")?,
+        session_json: string_to_cstring(&request.session_json, "DSL session JSON")?,
+        decoders_json: string_to_cstring(&request.decoders_json, "DSL decoders JSON")?,
+        samplerate_hz: request.samplerate_hz,
+        trigger_time_ms: request.trigger_time_ms,
+        trigger_pos: request.trigger_pos,
     })
 }
 

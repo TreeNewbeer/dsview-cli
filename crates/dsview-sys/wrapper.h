@@ -56,6 +56,32 @@ struct dsview_stream_export_facts {
     unsigned long long output_bytes;
 };
 
+struct dsview_dsl_channel_spec {
+    uint16_t index;
+    const char *name;
+};
+
+struct dsview_dsl_export_request {
+    unsigned long long samplerate_hz;
+    const struct dsview_dsl_channel_spec *channels;
+    size_t channel_count;
+    const char *driver_name;
+    long long trigger_time_ms;
+    unsigned long long trigger_pos;
+    const char *session_json;
+    const char *decoders_json;
+};
+
+struct dsview_dsl_stream_progress {
+    unsigned long long sample_count;
+    size_t packet_count;
+    size_t block_count;
+    int saw_logic_packet;
+    int saw_end_packet;
+    int end_packet_status;
+    int status;
+};
+
 #define DSVIEW_TRIGGER_PROBE_CAPACITY 16
 #define DSVIEW_TRIGGER_STAGE_CAPACITY 16
 
@@ -427,6 +453,47 @@ int dsview_bridge_render_vcd_from_cross_logic_packets(
     size_t logic_packet_count,
     struct dsview_export_buffer *out_buffer);
 void dsview_bridge_free_export_buffer(struct dsview_export_buffer *buffer);
+int dsview_bridge_ds_recorded_stream_sample_count(unsigned long long *out_sample_count);
+int dsview_bridge_ds_export_recorded_dsl(
+    const struct dsview_dsl_export_request *request,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts);
+int dsview_bridge_ds_begin_streaming_dsl(
+    unsigned long long samplerate_hz,
+    const uint16_t *enabled_channels,
+    size_t enabled_channel_count,
+    const char *path);
+int dsview_bridge_ds_get_streaming_dsl_progress(struct dsview_dsl_stream_progress *out_progress);
+int dsview_bridge_ds_finish_streaming_dsl(
+    const struct dsview_dsl_export_request *request,
+    struct dsview_stream_export_facts *out_facts);
+void dsview_bridge_ds_abort_streaming_dsl(void);
+int dsview_bridge_render_dsl_from_samples(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    uint16_t unitsize,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts);
+int dsview_bridge_render_dsl_from_logic_packets(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    const size_t *logic_packet_lengths,
+    size_t logic_packet_count,
+    uint16_t unitsize,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts);
+int dsview_bridge_render_dsl_from_cross_logic_packets(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    const size_t *logic_packet_lengths,
+    size_t logic_packet_count,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts);
+int dsview_bridge_ds_device_from_file(const char *file_path);
+int dsview_bridge_ds_remove_device(ds_device_handle handle);
 
 int dsview_decode_runtime_load(const char *path);
 void dsview_decode_runtime_unload(void);

@@ -25,32 +25,32 @@ use dsview_cli::{
 use dsview_core::{
     AcquisitionSummary, AcquisitionTerminalEvent, BringUpError, CaptureArtifactPathError,
     CaptureCleanup, CaptureCompletion, CaptureConfigError, CaptureConfigRequest,
-    CaptureDeviceOptionFacts, CaptureExportError, CaptureRunError, CaptureRunRequest,
-    ChannelModeGroupSnapshot, ChannelModeOptionSnapshot, CurrentDeviceOptionValues,
-    DecodeBringUpError, DecodeConfig, DecodeConfigLoadError, DecodeConfigParseError,
-    DecodeConfigValidationError, DecodeDiscovery, DecodeFailureReport, DecodeReport,
-    DecoderRuntimeError, DecoderRuntimeErrorCode, DeviceIdentitySnapshot, DeviceOptionApplyFailure,
-    DeviceOptionValidationCapabilities, DeviceOptionValidationError, DeviceOptionsSnapshot,
-    Discovery, EnumOptionSnapshot, MetadataAcquisitionInfo, MetadataArtifactInfo,
-    MetadataCaptureInfo, MetadataToolInfo, NativeErrorCode, OfflineDecodeInput,
-    OfflineDecodeInputError, OfflineDecodeRunError, OperationModeValidationCapabilities,
-    RuntimeError, SelectionHandle, SupportedDevice, ThresholdCapabilitySnapshot,
-    TriggerConfigParseError, TriggerReport, TriggerRequest, TriggerValidationContext,
-    TriggerValidationError, ValidatedCaptureConfig, ValidatedDecodeConfig, ValidatedTrigger,
-    decode_inspect as core_decode_inspect,
+    CaptureDeviceOptionFacts, CaptureExportError, CaptureOutputPlan, CaptureOutputPlanError,
+    CaptureRunError, CaptureRunRequest, ChannelModeGroupSnapshot, ChannelModeOptionSnapshot,
+    CurrentDeviceOptionValues, DecodeBringUpError, DecodeConfig, DecodeConfigLoadError,
+    DecodeConfigParseError, DecodeConfigValidationError, DecodeDiscovery, DecodeFailureReport,
+    DecodeReport, DecoderRuntimeError, DecoderRuntimeErrorCode, DeviceIdentitySnapshot,
+    DeviceOptionApplyFailure, DeviceOptionValidationCapabilities, DeviceOptionValidationError,
+    DeviceOptionsSnapshot, Discovery, EnumOptionSnapshot, MetadataAcquisitionInfo,
+    MetadataArtifactInfo, MetadataCaptureInfo, MetadataToolInfo, NativeErrorCode,
+    OfflineDecodeInput, OfflineDecodeInputError, OfflineDecodeRunError,
+    OperationModeValidationCapabilities, RuntimeError, SelectionHandle, SupportedDevice,
+    ThresholdCapabilitySnapshot, TriggerConfigParseError, TriggerReport, TriggerRequest,
+    TriggerValidationContext, TriggerValidationError, ValidatedCaptureConfig,
+    ValidatedDecodeConfig, ValidatedTrigger, decode_inspect as core_decode_inspect,
     decode_list as core_decode_list, decode_registry_for_config, describe_native_error,
-    parse_decode_config_slice, resolve_capture_artifact_paths,
-    run_offline_decode as core_run_offline_decode, validate_decode_config,
-    validate_decode_config_file as core_validate_decode_config_file,
-    parse_simple_trigger_tokens, parse_trigger_config, validate_trigger_request,
-    validated_capture_config_from_device_options,
+    parse_decode_config_slice, parse_simple_trigger_tokens, parse_trigger_config,
+    resolve_capture_output_plan, run_offline_decode as core_run_offline_decode,
+    validate_decode_config, validate_decode_config_file as core_validate_decode_config_file,
+    validate_trigger_request, validated_capture_config_from_device_options,
 };
 use serde::Serialize;
 
 #[cfg(debug_assertions)]
 use dsview_core::{
-    DecodeCapturedAnnotation, DecodeExecutionLogicFormat, DecodeRuntimeError, OfflineDecodeRuntime,
-    OfflineDecodeRuntimeSession,
+    DecodeCapturedAnnotation, DecodeExecutionLogicFormat, DecodeRuntimeError,
+    DslSessionMetadataInput, OfflineDecodeRuntime, OfflineDecodeRuntimeSession,
+    build_dsl_export_request, write_minimal_store_dsl_zip,
 };
 
 const BUILD_VERSION: &str = match option_env!("DSVIEW_BUILD_VERSION") {
@@ -275,13 +275,20 @@ struct CaptureArgs {
     #[arg(
         long = "output",
         value_name = "PATH",
-        help = "Final VCD artifact path; must end with .vcd"
+        required_unless_present = "dsl_output",
+        help = "Final capture artifact path; must end with .vcd or .dsl"
     )]
-    output: PathBuf,
+    output: Option<PathBuf>,
+    #[arg(
+        long = "dsl-output",
+        value_name = "PATH",
+        help = "Optional DSView session archive path; must end with .dsl"
+    )]
+    dsl_output: Option<PathBuf>,
     #[arg(
         long = "metadata-output",
         value_name = "PATH",
-        help = "Optional metadata JSON path; defaults to the VCD path with a .json extension"
+        help = "Optional metadata JSON path; defaults to the primary output path with a .json extension"
     )]
     metadata_output: Option<PathBuf>,
     #[arg(
@@ -456,7 +463,10 @@ struct CaptureResponse {
 
 #[derive(Serialize)]
 struct CaptureArtifactsResponse {
-    vcd_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vcd_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dsl_path: Option<String>,
     metadata_path: String,
 }
 
@@ -1308,17 +1318,30 @@ fn run_open(args: OpenArgs) -> Result<(), FailedCommand> {
 }
 
 fn run_capture(args: CaptureArgs) -> Result<(), FailedCommand> {
-    let artifact_paths =
-        resolve_capture_artifact_paths(&args.output, args.metadata_output.as_ref()).map_err(
-            |error| command_error(args.runtime.format, classify_artifact_path_error(&error)),
-        )?;
+    let output_plan = resolve_capture_output_plan(
+        args.output.as_ref(),
+        args.dsl_output.as_ref(),
+        args.metadata_output.as_ref(),
+    )
+    .map_err(|error| command_error(args.runtime.format, classify_output_plan_error(&error)))?;
     let interrupt_flag = if args.until_interrupt {
         Some(install_interrupt_flag(args.runtime.format)?)
     } else {
         None
     };
     let streaming_vcd_path = if args.duration_ms.is_some() || args.until_interrupt {
-        Some(streaming_vcd_temp_path(&artifact_paths.vcd_path))
+        output_plan
+            .vcd_path
+            .as_deref()
+            .map(|path| streaming_temp_path(path, "vcd"))
+    } else {
+        None
+    };
+    let streaming_dsl_path = if args.duration_ms.is_some() || args.until_interrupt {
+        output_plan
+            .dsl_path
+            .as_deref()
+            .map(|path| streaming_temp_path(path, "dsl"))
     } else {
         None
     };
@@ -1384,7 +1407,7 @@ fn run_capture(args: CaptureArgs) -> Result<(), FailedCommand> {
         return run_capture_with_test_fixture(
             args.runtime.format,
             handle,
-            &artifact_paths,
+            &output_plan,
             validated_config,
             validated_device_options,
             device_options_snapshot,
@@ -1405,6 +1428,7 @@ fn run_capture(args: CaptureArgs) -> Result<(), FailedCommand> {
         stop_after: args.duration_ms.map(Duration::from_millis),
         stop_on_interrupt: interrupt_flag.clone(),
         stream_vcd_path: streaming_vcd_path.clone(),
+        stream_dsl_path: streaming_dsl_path.clone(),
         trigger: validated_trigger.clone(),
         wait_timeout: Duration::from_millis(args.wait_timeout_ms),
         poll_interval: Duration::from_millis(args.poll_interval_ms),
@@ -1441,11 +1465,12 @@ fn run_capture(args: CaptureArgs) -> Result<(), FailedCommand> {
             .map_err(|error| command_error(args.runtime.format, classify_error(&error)))?
     };
     let export = discovery
-        .export_clean_capture_vcd(&dsview_core::CaptureExportRequest {
+        .export_clean_capture(&dsview_core::CaptureExportRequest {
             capture: result.clone(),
             validated_config,
-            vcd_path: artifact_paths.vcd_path,
-            metadata_path: Some(artifact_paths.metadata_path),
+            vcd_path: output_plan.vcd_path,
+            dsl_path: output_plan.dsl_path,
+            metadata_path: Some(output_plan.metadata_path),
             tool_name: env!("CARGO_PKG_NAME").to_string(),
             tool_version: BUILD_VERSION.to_string(),
             capture_started_at,
@@ -1467,7 +1492,8 @@ fn run_capture(args: CaptureArgs) -> Result<(), FailedCommand> {
         device_options: export.metadata.device_options.clone(),
         trigger: export.metadata.trigger.clone(),
         artifacts: CaptureArtifactsResponse {
-            vcd_path: export.vcd_path.display().to_string(),
+            vcd_path: export.vcd_path.map(|path| path.display().to_string()),
+            dsl_path: export.dsl_path.map(|path| path.display().to_string()),
             metadata_path: export.metadata_path.display().to_string(),
         },
     };
@@ -1497,12 +1523,12 @@ fn install_interrupt_flag(format: OutputFormat) -> Result<Arc<AtomicBool>, Faile
     Ok(interrupted)
 }
 
-fn streaming_vcd_temp_path(vcd_path: &Path) -> PathBuf {
-    let extension = vcd_path
+fn streaming_temp_path(path: &Path, fallback_extension: &str) -> PathBuf {
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .unwrap_or("vcd");
-    vcd_path.with_extension(format!("{extension}.streaming.tmp"))
+        .unwrap_or(fallback_extension);
+    path.with_extension(format!("{extension}.streaming.tmp"))
 }
 
 #[cfg(debug_assertions)]
@@ -1567,7 +1593,7 @@ fn fixture_validated_capture_config(
 fn run_capture_with_test_fixture(
     format: OutputFormat,
     handle: SelectionHandle,
-    artifact_paths: &dsview_core::CaptureArtifactPaths,
+    output_plan: &CaptureOutputPlan,
     validated_config: ValidatedCaptureConfig,
     validated_device_options: Option<dsview_core::ValidatedDeviceOptionRequest>,
     device_options_snapshot: Option<DeviceOptionsSnapshot>,
@@ -1648,14 +1674,16 @@ fn run_capture_with_test_fixture(
                 cleanup: fixture_capture_cleanup(),
                 effective_device_options,
                 streamed_vcd: None,
+                streamed_dsl: None,
                 trigger,
             };
             let trigger_report = capture.trigger.as_ref().map(TriggerReport::from_outcome);
             let export_request = dsview_core::CaptureExportRequest {
                 capture: capture.clone(),
                 validated_config: validated_config.clone(),
-                vcd_path: artifact_paths.vcd_path.clone(),
-                metadata_path: Some(artifact_paths.metadata_path.clone()),
+                vcd_path: output_plan.vcd_path.clone(),
+                dsl_path: output_plan.dsl_path.clone(),
+                metadata_path: Some(output_plan.metadata_path.clone()),
                 tool_name: env!("CARGO_PKG_NAME").to_string(),
                 tool_version: BUILD_VERSION.to_string(),
                 capture_started_at: std::time::UNIX_EPOCH,
@@ -1675,9 +1703,8 @@ fn run_capture_with_test_fixture(
                 )
             })?;
             write_capture_test_fixture_artifacts(
-                artifact_paths,
-                handle,
-                &validated_config,
+                output_plan,
+                &export_request,
                 &facts,
                 trigger_report.clone(),
             )
@@ -1697,8 +1724,15 @@ fn run_capture_with_test_fixture(
                 device_options: facts,
                 trigger: trigger_report,
                 artifacts: CaptureArtifactsResponse {
-                    vcd_path: artifact_paths.vcd_path.display().to_string(),
-                    metadata_path: artifact_paths.metadata_path.display().to_string(),
+                    vcd_path: output_plan
+                        .vcd_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    dsl_path: output_plan
+                        .dsl_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    metadata_path: output_plan.metadata_path.display().to_string(),
                 },
             };
             render_capture_success(format, &response);
@@ -1794,37 +1828,66 @@ fn fixture_inherited_effective_device_option_state(
 
 #[cfg(debug_assertions)]
 fn write_capture_test_fixture_artifacts(
-    artifact_paths: &dsview_core::CaptureArtifactPaths,
-    handle: SelectionHandle,
-    validated_config: &ValidatedCaptureConfig,
+    output_plan: &CaptureOutputPlan,
+    export_request: &dsview_core::CaptureExportRequest,
     facts: &CaptureDeviceOptionFacts,
     trigger: Option<TriggerReport>,
 ) -> Result<(), String> {
-    if let Some(parent) = artifact_paths.vcd_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    if let Some(parent) = artifact_paths.metadata_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if let Some(vcd_path) = output_plan.vcd_path.as_ref() {
+        if let Some(parent) = vcd_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let vcd_bytes = b"$date fixture $end\n$version dsview-cli fixture $end\n#0\n";
+        fs::write(vcd_path, vcd_bytes).map_err(|error| error.to_string())?;
     }
 
-    let vcd_bytes = b"$date fixture $end\n$version dsview-cli fixture $end\n#0\n";
-    fs::write(&artifact_paths.vcd_path, vcd_bytes).map_err(|error| error.to_string())?;
+    if let Some(dsl_path) = output_plan.dsl_path.as_ref() {
+        let dsl_sample_count = export_request
+            .validated_config
+            .effective_sample_limit
+            .clamp(1, 65_536);
+        let title = format!("{} v{}", export_request.tool_name, export_request.tool_version);
+        let dsl_request = build_dsl_export_request(&DslSessionMetadataInput {
+            title: &title,
+            device_model: &export_request.device_model,
+            samplerate_hz: export_request.validated_config.sample_rate_hz,
+            sample_count: dsl_sample_count,
+            enabled_channels: &export_request.validated_config.enabled_channels,
+            capture_started_at: export_request.capture_started_at,
+            device_options_snapshot: &export_request.device_options_snapshot,
+            effective_options: &facts.effective,
+            trigger: export_request.capture.trigger.as_ref(),
+        });
+        let byte_len = (((dsl_sample_count as usize) + 7) / 8).max(8);
+        let patterns = [0xAA_u8, 0xCC, 0xF0, 0x55, 0x33, 0x0F, 0x99, 0x66];
+        let mut channel_data = std::collections::BTreeMap::new();
+        for &channel in &export_request.validated_config.enabled_channels {
+            let pattern = patterns[(channel as usize) % patterns.len()];
+            channel_data.insert(channel, vec![pattern; byte_len]);
+        }
+        write_minimal_store_dsl_zip(dsl_path, &dsl_request, &channel_data, dsl_sample_count)
+            .map_err(|error| error.to_string())?;
+    }
+
+    if let Some(parent) = output_plan.metadata_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
 
     let metadata = dsview_core::CaptureMetadata {
         schema_version: 2,
         tool: MetadataToolInfo {
-            name: env!("CARGO_PKG_NAME").to_string(),
-            version: BUILD_VERSION.to_string(),
+            name: export_request.tool_name.clone(),
+            version: export_request.tool_version.clone(),
         },
         capture: MetadataCaptureInfo {
             timestamp_utc: "1970-01-01T00:00:00Z".to_string(),
-            device_model: "DSLogic Plus".to_string(),
-            device_stable_id: "dslogic-plus".to_string(),
-            selected_handle: handle.raw(),
-            sample_rate_hz: validated_config.sample_rate_hz,
-            requested_sample_limit: validated_config.requested_sample_limit,
-            actual_sample_count: validated_config.effective_sample_limit,
-            enabled_channels: validated_config.enabled_channels.clone(),
+            device_model: export_request.device_model.clone(),
+            device_stable_id: export_request.device_stable_id.clone(),
+            selected_handle: export_request.selected_handle.raw(),
+            sample_rate_hz: export_request.validated_config.sample_rate_hz,
+            requested_sample_limit: export_request.validated_config.requested_sample_limit,
+            actual_sample_count: export_request.validated_config.effective_sample_limit,
+            enabled_channels: export_request.validated_config.enabled_channels.clone(),
         },
         acquisition: MetadataAcquisitionInfo {
             completion: "clean_success".to_string(),
@@ -1834,14 +1897,21 @@ fn write_capture_test_fixture_artifacts(
             end_packet_status: Some("ok".to_string()),
         },
         artifacts: MetadataArtifactInfo {
-            vcd_path: artifact_paths.vcd_path.display().to_string(),
-            metadata_path: artifact_paths.metadata_path.display().to_string(),
+            vcd_path: output_plan
+                .vcd_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            dsl_path: output_plan
+                .dsl_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            metadata_path: output_plan.metadata_path.display().to_string(),
         },
         device_options: facts.clone(),
         trigger,
     };
     let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| error.to_string())?;
-    fs::write(&artifact_paths.metadata_path, metadata_bytes).map_err(|error| error.to_string())
+    fs::write(&output_plan.metadata_path, metadata_bytes).map_err(|error| error.to_string())
 }
 
 #[cfg(debug_assertions)]
@@ -2547,45 +2617,93 @@ fn capture_test_validation_capabilities() -> DeviceOptionValidationCapabilities 
     }
 }
 
+fn simple_error_response(code: &'static str, message: String) -> ErrorResponse {
+    ErrorResponse {
+        code,
+        message,
+        detail: None,
+        native_error: None,
+        terminal_event: None,
+        cleanup: None,
+    }
+}
+
 fn classify_artifact_path_error(error: &CaptureArtifactPathError) -> ErrorResponse {
     match error {
-        CaptureArtifactPathError::InvalidVcdExtension { path } => ErrorResponse {
-            code: "capture_output_path_invalid",
-            message: format!(
+        CaptureArtifactPathError::InvalidVcdExtension { path } => simple_error_response(
+            "capture_output_path_invalid",
+            format!(
                 "VCD output path `{}` must use the .vcd extension",
                 path.display()
             ),
-            detail: None,
-            native_error: None,
-            terminal_event: None,
-            cleanup: None,
-        },
-        CaptureArtifactPathError::InvalidMetadataExtension { path } => ErrorResponse {
-            code: "capture_metadata_output_path_invalid",
-            message: format!(
+        ),
+        CaptureArtifactPathError::InvalidMetadataExtension { path } => simple_error_response(
+            "capture_metadata_output_path_invalid",
+            format!(
                 "metadata output path `{}` must use the .json extension",
                 path.display()
             ),
-            detail: None,
-            native_error: None,
-            terminal_event: None,
-            cleanup: None,
-        },
+        ),
         CaptureArtifactPathError::ConflictingArtifactPaths {
             vcd_path,
             metadata_path,
-        } => ErrorResponse {
-            code: "capture_artifact_paths_conflict",
-            message: format!(
+        } => simple_error_response(
+            "capture_artifact_paths_conflict",
+            format!(
                 "VCD output path `{}` and metadata output path `{}` must be different",
                 vcd_path.display(),
                 metadata_path.display()
             ),
-            detail: None,
-            native_error: None,
-            terminal_event: None,
-            cleanup: None,
-        },
+        ),
+    }
+}
+
+fn classify_output_plan_error(error: &CaptureOutputPlanError) -> ErrorResponse {
+    match error {
+        CaptureOutputPlanError::MissingPrimaryOutput => simple_error_response(
+            "capture_output_path_missing",
+            "either `--output` (.vcd or .dsl) or `--dsl-output` is required".to_string(),
+        ),
+        CaptureOutputPlanError::InvalidOutputExtension { path } => simple_error_response(
+            "capture_output_path_invalid",
+            format!(
+                "output path `{}` must use the .vcd or .dsl extension",
+                path.display()
+            ),
+        ),
+        CaptureOutputPlanError::InvalidDslExtension { path } => simple_error_response(
+            "capture_dsl_output_path_invalid",
+            format!(
+                "DSL output path `{}` must use the .dsl extension",
+                path.display()
+            ),
+        ),
+        CaptureOutputPlanError::InvalidMetadataExtension { path } => simple_error_response(
+            "capture_metadata_output_path_invalid",
+            format!(
+                "metadata output path `{}` must use the .json extension",
+                path.display()
+            ),
+        ),
+        CaptureOutputPlanError::DuplicateDslTarget {
+            output_path,
+            dsl_output_path,
+        } => simple_error_response(
+            "capture_duplicate_dsl_output",
+            format!(
+                "cannot specify `--dsl-output` (`{}`) when `--output` (`{}`) already ends with .dsl",
+                dsl_output_path.display(),
+                output_path.display()
+            ),
+        ),
+        CaptureOutputPlanError::ConflictingArtifactPaths { left, right } => simple_error_response(
+            "capture_artifact_paths_conflict",
+            format!(
+                "artifact paths `{}` and `{}` must be different",
+                left.display(),
+                right.display()
+            ),
+        ),
     }
 }
 
@@ -3046,6 +3164,7 @@ pub(crate) fn classify_export_error(error: &CaptureExportError) -> ErrorResponse
             cleanup: None,
         },
         CaptureExportError::InvalidArtifactPaths(error) => classify_artifact_path_error(error),
+        CaptureExportError::InvalidOutputPlan(error) => classify_output_plan_error(error),
         CaptureExportError::ExportFailed { path, kind, detail } => ErrorResponse {
             code: match kind {
                 dsview_core::CaptureExportFailureKind::Precondition { .. } => {
@@ -3053,7 +3172,7 @@ pub(crate) fn classify_export_error(error: &CaptureExportError) -> ErrorResponse
                 }
                 dsview_core::CaptureExportFailureKind::Runtime => "capture_export_failed",
             },
-            message: format!("failed to write VCD artifact `{}`", path.display()),
+            message: format!("failed to write capture artifact `{}`", path.display()),
             detail: Some(detail.clone()),
             native_error: None,
             terminal_event: None,
@@ -3329,7 +3448,12 @@ pub(crate) fn capture_success_text(response: &CaptureResponse) -> String {
     if let Some(trigger) = response.trigger.as_ref() {
         lines.push(trigger_report_text(trigger));
     }
-    lines.push(format!("vcd {}", response.artifacts.vcd_path));
+    if let Some(vcd_path) = response.artifacts.vcd_path.as_deref() {
+        lines.push(format!("vcd {vcd_path}"));
+    }
+    if let Some(dsl_path) = response.artifacts.dsl_path.as_deref() {
+        lines.push(format!("dsl {dsl_path}"));
+    }
     lines.push(format!("metadata {}", response.artifacts.metadata_path));
     lines.join("\n")
 }
@@ -4064,7 +4188,8 @@ mod tests {
             channels: vec![0, 1, 2, 3],
             device_options: CaptureDeviceOptionArgs::default(),
             trigger: CaptureTriggerArgs::default(),
-            output: PathBuf::from("artifacts/run.vcd"),
+            output: Some(PathBuf::from("artifacts/run.vcd")),
+            dsl_output: None,
             metadata_output: None,
             wait_timeout_ms: 10_000,
             duration_ms: None,
@@ -4108,7 +4233,8 @@ mod tests {
             saw_terminal_normal_end: true,
             cleanup_succeeded: true,
             artifacts: CaptureArtifactsResponse {
-                vcd_path: "/tmp/run.vcd".to_string(),
+                vcd_path: Some("/tmp/run.vcd".to_string()),
+                dsl_path: None,
                 metadata_path: "/tmp/run.json".to_string(),
             },
             device_options: sample_capture_device_option_facts(),
@@ -4126,6 +4252,53 @@ mod tests {
             payload["device_options"]["effective"]["enabled_channels"],
             serde_json::json!([0, 2, 4, 6])
         );
+        assert!(payload["artifacts"].get("dsl_path").is_none());
+    }
+
+    #[test]
+    fn capture_response_and_text_support_dsl_only_and_dual_artifacts() {
+        let dsl_only = CaptureResponse {
+            selected_handle: 7,
+            completion: "clean_success",
+            saw_logic_packet: true,
+            saw_end_packet: true,
+            saw_terminal_normal_end: true,
+            cleanup_succeeded: true,
+            artifacts: CaptureArtifactsResponse {
+                vcd_path: None,
+                dsl_path: Some("/tmp/run.dsl".to_string()),
+                metadata_path: "/tmp/run.json".to_string(),
+            },
+            device_options: sample_capture_device_option_facts(),
+            trigger: None,
+        };
+        let dsl_json = serde_json::to_value(&dsl_only).unwrap();
+        assert!(dsl_json["artifacts"].get("vcd_path").is_none());
+        assert_eq!(dsl_json["artifacts"]["dsl_path"], "/tmp/run.dsl");
+        let dsl_text = capture_success_text(&dsl_only);
+        assert!(!dsl_text.contains("\nvcd "));
+        assert!(dsl_text.contains("dsl /tmp/run.dsl"));
+        assert!(dsl_text.contains("metadata /tmp/run.json"));
+
+        let both = CaptureResponse {
+            selected_handle: 7,
+            completion: "clean_success",
+            saw_logic_packet: true,
+            saw_end_packet: true,
+            saw_terminal_normal_end: true,
+            cleanup_succeeded: true,
+            artifacts: CaptureArtifactsResponse {
+                vcd_path: Some("/tmp/run.vcd".to_string()),
+                dsl_path: Some("/tmp/run.dsl".to_string()),
+                metadata_path: "/tmp/run.json".to_string(),
+            },
+            device_options: sample_capture_device_option_facts(),
+            trigger: None,
+        };
+        let both_text = capture_success_text(&both);
+        assert!(both_text.contains("vcd /tmp/run.vcd"));
+        assert!(both_text.contains("dsl /tmp/run.dsl"));
+        assert!(both_text.contains("metadata /tmp/run.json"));
     }
 
     #[test]
@@ -4138,7 +4311,8 @@ mod tests {
             saw_terminal_normal_end: true,
             cleanup_succeeded: true,
             artifacts: CaptureArtifactsResponse {
-                vcd_path: "/tmp/run.vcd".to_string(),
+                vcd_path: Some("/tmp/run.vcd".to_string()),
+                dsl_path: None,
                 metadata_path: "/tmp/run.json".to_string(),
             },
             device_options: sample_capture_device_option_facts(),

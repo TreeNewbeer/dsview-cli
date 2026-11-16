@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 
 #include "libsigrok-internal.h"
 
@@ -54,6 +58,48 @@ typedef const struct sr_output_module *(*sr_output_find_fn)(char *id);
 typedef const struct sr_output *(*sr_output_new_fn)(const struct sr_output_module *omod, GHashTable *options, const struct sr_dev_inst *sdi);
 typedef int (*sr_output_send_fn)(const struct sr_output *o, const struct sr_datafeed_packet *packet, GString **out);
 typedef int (*sr_output_free_fn)(const struct sr_output *o);
+typedef int (*ds_device_from_file_fn)(const char *file_path);
+typedef int (*ds_remove_device_fn)(ds_device_handle handle);
+
+/* ABI-compatible minizip types from DSView/common/minizip/zip.h */
+typedef void *dsview_zip_file;
+typedef struct dsview_tm_zip_s {
+    unsigned int tm_sec;
+    unsigned int tm_min;
+    unsigned int tm_hour;
+    unsigned int tm_mday;
+    unsigned int tm_mon;
+    unsigned int tm_year;
+} dsview_tm_zip;
+
+typedef struct dsview_zip_fileinfo_s {
+    dsview_tm_zip tmz_date;
+    unsigned long dosDate;
+    unsigned long internal_fa;
+    unsigned long external_fa;
+} dsview_zip_fileinfo;
+
+typedef dsview_zip_file (*zip_open64_fn)(const void *pathname, int append);
+typedef int (*zip_open_new_file_in_zip_fn)(
+    dsview_zip_file file,
+    const char *filename,
+    const dsview_zip_fileinfo *zipfi,
+    const void *extrafield_local,
+    unsigned int size_extrafield_local,
+    const void *extrafield_global,
+    unsigned int size_extrafield_global,
+    const char *comment,
+    int method,
+    int level);
+typedef int (*zip_write_in_file_in_zip_fn)(dsview_zip_file file, const void *buf, unsigned int len);
+typedef int (*zip_close_file_in_zip_fn)(dsview_zip_file file);
+typedef int (*zip_close_fn)(dsview_zip_file file, const char *global_comment);
+
+#define DSVIEW_ZIP_OK 0
+#define DSVIEW_Z_DEFLATED 8
+#define DSVIEW_Z_BEST_SPEED 1
+#define DSVIEW_DSL_LEAF_BLOCK_SAMPLES (1ULL << 24)
+#define DSVIEW_DSL_LEAF_BLOCK_BYTES ((size_t)(DSVIEW_DSL_LEAF_BLOCK_SAMPLES / 8ULL))
 typedef int (*srd_init_fn)(const char *path);
 typedef int (*srd_exit_fn)(void);
 typedef const GSList *(*srd_decoder_list_fn)(void);
@@ -146,6 +192,14 @@ struct dsview_bridge_api {
     sr_output_new_fn sr_output_new;
     sr_output_send_fn sr_output_send;
     sr_output_free_fn sr_output_free;
+    /* Optional archive/virtual-session symbols available when minizip/zlib are linked. */
+    ds_device_from_file_fn ds_device_from_file;
+    ds_remove_device_fn ds_remove_device;
+    zip_open64_fn zip_open64;
+    zip_open_new_file_in_zip_fn zip_open_new_file_in_zip;
+    zip_write_in_file_in_zip_fn zip_write_in_file_in_zip;
+    zip_close_file_in_zip_fn zip_close_file_in_zip;
+    zip_close_fn zip_close;
     char last_error[512];
 };
 
@@ -235,12 +289,31 @@ struct dsview_streaming_vcd_writer {
     int status;
 };
 
+struct dsview_dsl_writer {
+    int active;
+    dsview_zip_file zip_handle;
+    char *path;
+    unsigned long long samplerate_hz;
+    uint16_t channel_count;
+    uint16_t *channel_indices;
+    uint8_t **channel_buffers;
+    size_t block_samples;
+    size_t block_count;
+    unsigned long long total_samples;
+    size_t packet_count;
+    int saw_logic_packet;
+    int saw_end_packet;
+    int end_packet_status;
+    int status;
+};
+
 static struct dsview_bridge_api g_bridge_api;
 static struct dsview_decode_runtime_api g_decode_runtime_api;
 static struct dsview_bridge_acquisition_summary g_acquisition_summary;
 static int g_acquisition_callback_registration_active = 0;
 static struct dsview_recorded_stream g_recorded_stream;
 static struct dsview_streaming_vcd_writer g_streaming_vcd_writer;
+static struct dsview_dsl_writer g_streaming_dsl_writer;
 static struct dsview_trigger_observation g_trigger_observation;
 
 #define DSVIEW_BRIDGE_INITIAL_PACKET_CAPACITY 1024U
@@ -248,8 +321,13 @@ static uint8_t g_enabled_channel_state[DSVIEW_BRIDGE_CHANNEL_TRACK_CAPACITY];
 
 static void dsview_bridge_clear_registered_callbacks(void);
 static void dsview_bridge_reset_recorded_stream(void);
+static void dsview_bridge_reset_streaming_dsl_writer(void);
+static int dsview_bridge_stream_vcd_emit_packet(struct dsview_retained_packet *packet);
+static int dsview_bridge_stream_dsl_emit_packet(const struct dsview_retained_packet *packet);
 static void dsview_bridge_reset_streaming_vcd_writer(void);
 static void dsview_bridge_reset_trigger_observation(void);
+static int dsview_bridge_has_active_streaming_writer(void);
+
 static int dsview_bridge_prepare_recording_capacity(void);
 static int dsview_bridge_record_packet(const struct sr_datafeed_packet *packet);
 static int dsview_bridge_export_stream(const struct dsview_vcd_export_request *request, const struct dsview_recorded_stream *stream, struct dsview_export_buffer *out_buffer);
@@ -2742,6 +2820,11 @@ static uint16_t dsview_bridge_expected_logic_unitsize(void)
     return g_recorded_stream.expected_unitsize != 0 ? g_recorded_stream.expected_unitsize : 1;
 }
 
+static int dsview_bridge_has_active_streaming_writer(void)
+{
+    return g_streaming_vcd_writer.active || g_streaming_dsl_writer.active;
+}
+
 static int dsview_bridge_prepare_recording_capacity(void)
 {
     unsigned long long sample_limit = 0;
@@ -2754,7 +2837,9 @@ static int dsview_bridge_prepare_recording_capacity(void)
     dsview_bridge_reset_recorded_stream();
 
     if (dsview_bridge_get_uint64_config(SR_CONF_LIMIT_SAMPLES, &sample_limit) != SR_OK) {
-        return DSVIEW_EXPORT_ERR_RUNTIME;
+        if (dsview_bridge_get_uint64_config(SR_CONF_HW_DEPTH, &sample_limit) != SR_OK) {
+            return DSVIEW_EXPORT_ERR_RUNTIME;
+        }
     }
     if (dsview_bridge_get_int16_config(SR_CONF_VLD_CH_NUM, &valid_channel_count) != SR_OK) {
         return DSVIEW_EXPORT_ERR_RUNTIME;
@@ -2775,7 +2860,7 @@ static int dsview_bridge_prepare_recording_capacity(void)
         unitsize = 1;
     }
 
-    if (g_streaming_vcd_writer.active) {
+    if (dsview_bridge_has_active_streaming_writer()) {
         g_recorded_stream.expected_unitsize = (uint16_t)unitsize;
         g_recorded_stream.enabled_channel_count = (uint16_t)enabled_channel_count;
         return SR_OK;
@@ -2813,7 +2898,9 @@ static int dsview_bridge_append_retained_packet(const struct dsview_retained_pac
             g_recorded_stream.overflowed = 1;
             return DSVIEW_EXPORT_ERR_OVERFLOW;
         }
-        next_capacity = g_recorded_stream.packet_capacity * 2;
+        next_capacity = g_recorded_stream.packet_capacity == 0
+            ? DSVIEW_BRIDGE_INITIAL_PACKET_CAPACITY
+            : g_recorded_stream.packet_capacity * 2;
         resized = (struct dsview_retained_packet *)realloc(
             g_recorded_stream.packets,
             next_capacity * sizeof(*g_recorded_stream.packets));
@@ -2860,7 +2947,7 @@ static int dsview_bridge_record_meta_packet(const struct sr_datafeed_packet *pac
         }
     }
 
-    if (g_streaming_vcd_writer.active) {
+    if (dsview_bridge_has_active_streaming_writer()) {
         return dsview_bridge_stream_emit_packet(&retained);
     }
 
@@ -2888,8 +2975,9 @@ static int dsview_bridge_record_logic_packet(const struct sr_datafeed_packet *pa
     if (logic->length > SIZE_MAX) {
         return DSVIEW_EXPORT_ERR_OVERFLOW;
     }
-    if (!g_streaming_vcd_writer.active
-        && g_recorded_stream.payload_bytes > g_recorded_stream.payload_capacity - (size_t)logic->length) {
+    if (!dsview_bridge_has_active_streaming_writer()
+        && ((size_t)logic->length > g_recorded_stream.payload_capacity
+            || g_recorded_stream.payload_bytes > g_recorded_stream.payload_capacity - (size_t)logic->length)) {
         g_recorded_stream.overflowed = 1;
         return DSVIEW_EXPORT_ERR_OVERFLOW;
     }
@@ -2925,7 +3013,7 @@ static int dsview_bridge_record_logic_packet(const struct sr_datafeed_packet *pa
     }
     g_recorded_stream.saw_logic_packet = 1;
 
-    if (g_streaming_vcd_writer.active) {
+    if (dsview_bridge_has_active_streaming_writer()) {
         retained.data = (uint8_t *)logic->data;
         return dsview_bridge_stream_emit_packet(&retained);
     }
@@ -2948,7 +3036,7 @@ static int dsview_bridge_record_end_packet(const struct sr_datafeed_packet *pack
     retained.status = packet->status;
     g_recorded_stream.saw_end_packet = 1;
     g_recorded_stream.end_packet_status = packet->status;
-    if (g_streaming_vcd_writer.active) {
+    if (dsview_bridge_has_active_streaming_writer()) {
         return dsview_bridge_stream_emit_packet(&retained);
     }
     return dsview_bridge_append_retained_packet(&retained);
@@ -3208,6 +3296,21 @@ int dsview_bridge_load_library(const char *path)
         return status;
     }
 
+    g_bridge_api.ds_device_from_file =
+        (ds_device_from_file_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "ds_device_from_file");
+    g_bridge_api.ds_remove_device =
+        (ds_remove_device_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "ds_remove_device");
+    g_bridge_api.zip_open64 =
+        (zip_open64_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "zipOpen64");
+    g_bridge_api.zip_open_new_file_in_zip =
+        (zip_open_new_file_in_zip_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "zipOpenNewFileInZip");
+    g_bridge_api.zip_write_in_file_in_zip =
+        (zip_write_in_file_in_zip_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "zipWriteInFileInZip");
+    g_bridge_api.zip_close_file_in_zip =
+        (zip_close_file_in_zip_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "zipCloseFileInZip");
+    g_bridge_api.zip_close =
+        (zip_close_fn)dsview_bridge_dlsym(g_bridge_api.library_handle, "zipClose");
+
     dsview_bridge_set_error_from_text(NULL);
     return DSVIEW_BRIDGE_OK;
 }
@@ -3216,6 +3319,7 @@ void dsview_bridge_unload_library(void)
 {
     dsview_bridge_clear_registered_callbacks();
     dsview_bridge_reset_streaming_vcd_writer();
+    dsview_bridge_reset_streaming_dsl_writer();
     dsview_bridge_reset_recorded_stream();
 
     if (g_bridge_api.library_handle != NULL) {
@@ -4571,7 +4675,7 @@ static int dsview_bridge_emit_cross_logic_packet(
     return status;
 }
 
-static int dsview_bridge_stream_emit_packet(struct dsview_retained_packet *packet)
+static int dsview_bridge_stream_vcd_emit_packet(struct dsview_retained_packet *packet)
 {
     GString *chunk = NULL;
     int status;
@@ -4626,6 +4730,20 @@ static int dsview_bridge_stream_emit_packet(struct dsview_retained_packet *packe
     }
     g_streaming_vcd_writer.packet_count++;
     return SR_OK;
+}
+
+static int dsview_bridge_stream_emit_packet(struct dsview_retained_packet *packet)
+{
+    int vcd_status = SR_OK;
+    int dsl_status = SR_OK;
+
+    if (g_streaming_vcd_writer.active) {
+        vcd_status = dsview_bridge_stream_vcd_emit_packet(packet);
+    }
+    if (g_streaming_dsl_writer.active) {
+        dsl_status = dsview_bridge_stream_dsl_emit_packet(packet);
+    }
+    return vcd_status != SR_OK ? vcd_status : dsl_status;
 }
 
 static int dsview_bridge_export_stream(const struct dsview_vcd_export_request *request, const struct dsview_recorded_stream *stream, struct dsview_export_buffer *out_buffer)
@@ -4847,7 +4965,7 @@ int dsview_bridge_ds_begin_streaming_vcd(
     meta_packet.type = DSVIEW_EXPORT_PACKET_META;
     meta_packet.status = SR_PKT_OK;
     meta_packet.samplerate_hz = request->samplerate_hz;
-    status = dsview_bridge_stream_emit_packet(&meta_packet);
+    status = dsview_bridge_stream_vcd_emit_packet(&meta_packet);
     if (status != SR_OK) {
         dsview_bridge_reset_streaming_vcd_writer();
         return status;
@@ -5141,6 +5259,882 @@ void dsview_bridge_free_export_buffer(struct dsview_export_buffer *buffer)
         g_free(buffer->data);
     }
     memset(buffer, 0, sizeof(*buffer));
+}
+
+static void dsview_dsl_format_samplerate(unsigned long long hz, char *buf, size_t buf_len)
+{
+    if (hz >= 1000000000ULL && (hz % 1000000000ULL) == 0ULL) {
+        snprintf(buf, buf_len, "%llu GHz", hz / 1000000000ULL);
+    } else if (hz >= 1000000ULL && (hz % 1000000ULL) == 0ULL) {
+        snprintf(buf, buf_len, "%llu MHz", hz / 1000000ULL);
+    } else if (hz >= 1000ULL && (hz % 1000ULL) == 0ULL) {
+        snprintf(buf, buf_len, "%llu kHz", hz / 1000ULL);
+    } else {
+        snprintf(buf, buf_len, "%llu Hz", hz);
+    }
+}
+
+static void dsview_dsl_make_zip_fileinfo(long long trigger_time_ms, dsview_zip_fileinfo *zi)
+{
+    memset(zi, 0, sizeof(*zi));
+    zi->tmz_date.tm_year = 1980;
+    zi->tmz_date.tm_mon = 0;
+    zi->tmz_date.tm_mday = 1;
+
+    if (trigger_time_ms > 0) {
+        time_t secs = (time_t)(trigger_time_ms / 1000LL);
+        struct tm utc_tm;
+#if defined(_WIN32)
+        if (gmtime_s(&utc_tm, &secs) == 0 && (utc_tm.tm_year + 1900) >= 1980) {
+#else
+        if (gmtime_r(&secs, &utc_tm) != NULL && (utc_tm.tm_year + 1900) >= 1980) {
+#endif
+            zi->tmz_date.tm_sec = (unsigned int)utc_tm.tm_sec;
+            zi->tmz_date.tm_min = (unsigned int)utc_tm.tm_min;
+            zi->tmz_date.tm_hour = (unsigned int)utc_tm.tm_hour;
+            zi->tmz_date.tm_mday = (unsigned int)utc_tm.tm_mday;
+            zi->tmz_date.tm_mon = (unsigned int)utc_tm.tm_mon;
+            zi->tmz_date.tm_year = (unsigned int)(utc_tm.tm_year + 1900);
+        }
+    }
+}
+
+static unsigned long long dsview_dsl_file_size(const char *path)
+{
+#if !defined(_WIN32)
+    struct stat st;
+    if (path != NULL && stat(path, &st) == 0 && st.st_size >= 0) {
+        return (unsigned long long)st.st_size;
+    }
+    return 0ULL;
+#else
+    FILE *file = path != NULL ? fopen(path, "rb") : NULL;
+    long long size = 0;
+    if (file == NULL) {
+        return 0ULL;
+    }
+    if (_fseeki64(file, 0, SEEK_END) == 0) {
+        size = _ftelli64(file);
+    }
+    fclose(file);
+    return size > 0 ? (unsigned long long)size : 0ULL;
+#endif
+}
+
+static int dsview_dsl_write_zip_entry(
+    dsview_zip_file zf,
+    const char *name,
+    const dsview_zip_fileinfo *zi,
+    const void *data,
+    size_t len)
+{
+    int zerr;
+    size_t offset = 0;
+
+    if (zf == NULL || name == NULL || zi == NULL
+        || g_bridge_api.zip_open_new_file_in_zip == NULL
+        || g_bridge_api.zip_write_in_file_in_zip == NULL
+        || g_bridge_api.zip_close_file_in_zip == NULL) {
+        return DSVIEW_EXPORT_ERR_RUNTIME;
+    }
+
+    zerr = g_bridge_api.zip_open_new_file_in_zip(
+        zf,
+        name,
+        zi,
+        NULL,
+        0,
+        NULL,
+        0,
+        NULL,
+        DSVIEW_Z_DEFLATED,
+        DSVIEW_Z_BEST_SPEED);
+    if (zerr != DSVIEW_ZIP_OK) {
+        return DSVIEW_EXPORT_ERR_RUNTIME;
+    }
+
+    while (offset < len) {
+        size_t remaining = len - offset;
+        unsigned int chunk_len = remaining > 65536U ? 65536U : (unsigned int)remaining;
+        zerr = g_bridge_api.zip_write_in_file_in_zip(
+            zf,
+            (const uint8_t *)data + offset,
+            chunk_len);
+        if (zerr < DSVIEW_ZIP_OK) {
+            g_bridge_api.zip_close_file_in_zip(zf);
+            return DSVIEW_EXPORT_ERR_RUNTIME;
+        }
+        offset += chunk_len;
+    }
+
+    zerr = g_bridge_api.zip_close_file_in_zip(zf);
+    return zerr == DSVIEW_ZIP_OK ? SR_OK : DSVIEW_EXPORT_ERR_RUNTIME;
+}
+
+static void dsview_dsl_writer_destroy(struct dsview_dsl_writer *writer)
+{
+    uint16_t ch;
+
+    if (writer == NULL) {
+        return;
+    }
+    if (writer->zip_handle != NULL && g_bridge_api.zip_close != NULL) {
+        g_bridge_api.zip_close(writer->zip_handle, NULL);
+        writer->zip_handle = NULL;
+    }
+    if (writer->channel_buffers != NULL) {
+        for (ch = 0; ch < writer->channel_count; ch++) {
+            free(writer->channel_buffers[ch]);
+        }
+        free(writer->channel_buffers);
+    }
+    free(writer->channel_indices);
+    free(writer->path);
+    memset(writer, 0, sizeof(*writer));
+    writer->end_packet_status = -1;
+    writer->status = SR_OK;
+}
+
+static void dsview_bridge_reset_streaming_dsl_writer(void)
+{
+    dsview_dsl_writer_destroy(&g_streaming_dsl_writer);
+}
+
+static int dsview_dsl_writer_init(
+    struct dsview_dsl_writer *writer,
+    const char *path,
+    unsigned long long samplerate_hz,
+    const uint16_t *channel_indices,
+    size_t channel_count)
+{
+    size_t c;
+
+    if (writer == NULL || path == NULL || path[0] == '\0' || channel_indices == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    if (samplerate_hz == 0) {
+        return DSVIEW_EXPORT_ERR_MISSING_SAMPLERATE;
+    }
+    if (channel_count == 0 || channel_count > UINT16_MAX) {
+        return DSVIEW_EXPORT_ERR_NO_ENABLED_CHANNELS;
+    }
+    if (g_bridge_api.zip_open64 == NULL
+        || g_bridge_api.zip_open_new_file_in_zip == NULL
+        || g_bridge_api.zip_write_in_file_in_zip == NULL
+        || g_bridge_api.zip_close_file_in_zip == NULL
+        || g_bridge_api.zip_close == NULL) {
+        return DSVIEW_EXPORT_ERR_RUNTIME;
+    }
+
+    memset(writer, 0, sizeof(*writer));
+    writer->end_packet_status = -1;
+    writer->status = SR_OK;
+    writer->samplerate_hz = samplerate_hz;
+    writer->channel_count = (uint16_t)channel_count;
+
+    writer->path = strdup(path);
+    writer->channel_indices = (uint16_t *)calloc(channel_count, sizeof(uint16_t));
+    writer->channel_buffers = (uint8_t **)calloc(channel_count, sizeof(uint8_t *));
+    if (writer->path == NULL || writer->channel_indices == NULL || writer->channel_buffers == NULL) {
+        dsview_dsl_writer_destroy(writer);
+        return SR_ERR_MALLOC;
+    }
+
+    for (c = 0; c < channel_count; c++) {
+        writer->channel_indices[c] = channel_indices[c];
+        writer->channel_buffers[c] = (uint8_t *)calloc(DSVIEW_DSL_LEAF_BLOCK_BYTES, 1);
+        if (writer->channel_buffers[c] == NULL) {
+            dsview_dsl_writer_destroy(writer);
+            return SR_ERR_MALLOC;
+        }
+    }
+
+    writer->zip_handle = g_bridge_api.zip_open64(path, 0);
+    if (writer->zip_handle == NULL) {
+        dsview_dsl_writer_destroy(writer);
+        return DSVIEW_EXPORT_ERR_RUNTIME;
+    }
+
+    writer->active = 1;
+    return SR_OK;
+}
+
+static int dsview_dsl_writer_flush_block(
+    struct dsview_dsl_writer *writer,
+    const dsview_zip_fileinfo *zi)
+{
+    size_t raw_bytes;
+    size_t padded_bytes;
+    uint16_t c;
+
+    if (writer == NULL || !writer->active) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    if (writer->block_samples == 0) {
+        return SR_OK;
+    }
+
+    raw_bytes = (writer->block_samples + 7U) / 8U;
+    padded_bytes = ((raw_bytes + 7U) / 8U) * 8U;
+    if (padded_bytes > DSVIEW_DSL_LEAF_BLOCK_BYTES) {
+        return DSVIEW_EXPORT_ERR_OVERFLOW;
+    }
+
+    for (c = 0; c < writer->channel_count; c++) {
+        char entry_name[64];
+        int status;
+
+        snprintf(
+            entry_name,
+            sizeof(entry_name),
+            "L-%u/%zu",
+            (unsigned int)writer->channel_indices[c],
+            writer->block_count);
+        status = dsview_dsl_write_zip_entry(
+            writer->zip_handle,
+            entry_name,
+            zi,
+            writer->channel_buffers[c],
+            padded_bytes);
+        if (status != SR_OK) {
+            return status;
+        }
+        memset(writer->channel_buffers[c], 0, padded_bytes);
+    }
+
+    writer->block_count++;
+    writer->total_samples += (unsigned long long)writer->block_samples;
+    writer->block_samples = 0;
+    return SR_OK;
+}
+
+static int dsview_dsl_writer_push_logic(
+    struct dsview_dsl_writer *writer,
+    const struct dsview_retained_packet *packet)
+{
+    dsview_zip_fileinfo zi;
+
+    if (writer == NULL || !writer->active || packet == NULL || packet->data == NULL
+        || packet->length == 0) {
+        return DSVIEW_EXPORT_ERR_GENERIC;
+    }
+
+    dsview_dsl_make_zip_fileinfo(0, &zi);
+
+    if (packet->format == LA_CROSS_DATA) {
+        size_t frame_bytes = (size_t)writer->channel_count * sizeof(uint64_t);
+        size_t offset = 0;
+
+        if (frame_bytes == 0 || (packet->length % frame_bytes) != 0
+            || (writer->block_samples % 64U) != 0) {
+            return DSVIEW_EXPORT_ERR_GENERIC;
+        }
+
+        while (offset < packet->length) {
+            size_t frames_left = (packet->length - offset) / frame_bytes;
+            size_t space_frames = (size_t)(DSVIEW_DSL_LEAF_BLOCK_SAMPLES - writer->block_samples) / 64U;
+            size_t take_frames = frames_left < space_frames ? frames_left : space_frames;
+            size_t base_byte = writer->block_samples / 8U;
+            size_t f;
+
+            for (f = 0; f < take_frames; f++) {
+                const uint8_t *frame = packet->data + offset + f * frame_bytes;
+                uint16_t c;
+                for (c = 0; c < writer->channel_count; c++) {
+                    memcpy(writer->channel_buffers[c] + base_byte + f * 8U, frame + c * 8U, 8U);
+                }
+            }
+
+            writer->block_samples += take_frames * 64U;
+            offset += take_frames * frame_bytes;
+
+            if (writer->block_samples == (size_t)DSVIEW_DSL_LEAF_BLOCK_SAMPLES) {
+                int status = dsview_dsl_writer_flush_block(writer, &zi);
+                if (status != SR_OK) {
+                    return status;
+                }
+            }
+        }
+        return SR_OK;
+    }
+
+    {
+        uint16_t min_unitsize = (uint16_t)((writer->channel_count + 7U) / 8U);
+        uint16_t unitsize = packet->unitsize != 0 ? packet->unitsize : min_unitsize;
+        size_t offset = 0;
+
+        if (min_unitsize == 0) {
+            min_unitsize = 1;
+        }
+        if (unitsize == 0 || unitsize < min_unitsize || (packet->length % unitsize) != 0) {
+            return DSVIEW_EXPORT_ERR_GENERIC;
+        }
+
+        while (offset < packet->length) {
+            const uint8_t *sample = packet->data + offset;
+            size_t byte_pos = writer->block_samples >> 3;
+            uint8_t bit_mask = (uint8_t)(1U << (writer->block_samples & 7U));
+            uint16_t c;
+
+            for (c = 0; c < writer->channel_count; c++) {
+                if (((sample[c >> 3] >> (c & 7U)) & 1U) != 0U) {
+                    writer->channel_buffers[c][byte_pos] |= bit_mask;
+                }
+            }
+
+            writer->block_samples++;
+            offset += unitsize;
+
+            if (writer->block_samples == (size_t)DSVIEW_DSL_LEAF_BLOCK_SAMPLES) {
+                int status = dsview_dsl_writer_flush_block(writer, &zi);
+                if (status != SR_OK) {
+                    return status;
+                }
+            }
+        }
+    }
+
+    return SR_OK;
+}
+
+static int dsview_dsl_writer_finish(
+    struct dsview_dsl_writer *writer,
+    const struct dsview_dsl_export_request *request,
+    struct dsview_stream_export_facts *out_facts)
+{
+    dsview_zip_fileinfo zi;
+    unsigned long long samplerate_hz;
+    char samplerate_str[64];
+    const char *driver_name;
+    const char *decoders_json;
+    const char *session_json;
+    GString *header = NULL;
+    char *saved_path = NULL;
+    size_t c;
+    int status;
+    int close_err;
+
+    if (writer == NULL || request == NULL || out_facts == NULL || request->channels == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    memset(out_facts, 0, sizeof(*out_facts));
+
+    if (!writer->active) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+    if (request->channel_count == 0 || request->channel_count != writer->channel_count) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    for (c = 0; c < request->channel_count; c++) {
+        if (request->channels[c].index != writer->channel_indices[c]) {
+            return DSVIEW_BRIDGE_ERR_ARG;
+        }
+    }
+
+    status = writer->status;
+    if (status == SR_OK && (!writer->saw_logic_packet || !writer->saw_end_packet)) {
+        status = DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+    if (status == SR_OK && writer->end_packet_status != SR_PKT_OK) {
+        status = DSVIEW_EXPORT_ERR_BAD_END_STATUS;
+    }
+    if (status != SR_OK) {
+        return status;
+    }
+
+    dsview_dsl_make_zip_fileinfo(request->trigger_time_ms, &zi);
+
+    status = dsview_dsl_writer_flush_block(writer, &zi);
+    if (status != SR_OK) {
+        return status;
+    }
+    if (writer->block_count == 0 || writer->total_samples == 0) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+
+    samplerate_hz = request->samplerate_hz != 0 ? request->samplerate_hz : writer->samplerate_hz;
+    if (samplerate_hz == 0) {
+        return DSVIEW_EXPORT_ERR_MISSING_SAMPLERATE;
+    }
+    dsview_dsl_format_samplerate(samplerate_hz, samplerate_str, sizeof(samplerate_str));
+
+    driver_name = (request->driver_name != NULL && request->driver_name[0] != '\0')
+        ? request->driver_name
+        : "DSLogic Plus";
+    decoders_json = (request->decoders_json != NULL && request->decoders_json[0] != '\0')
+        ? request->decoders_json
+        : "[]";
+    session_json = (request->session_json != NULL && request->session_json[0] != '\0')
+        ? request->session_json
+        : "{}";
+
+    header = g_string_sized_new(512);
+    if (header == NULL) {
+        return SR_ERR_MALLOC;
+    }
+    g_string_append_printf(
+        header,
+        "[version]\n"
+        "version = 3\n"
+        "[header]\n"
+        "driver = %s\n"
+        "device mode = 0\n"
+        "capturefile = data\n"
+        "total samples = %llu\n"
+        "total probes = %zu\n"
+        "total blocks = %zu\n"
+        "samplerate = %s\n"
+        "trigger time = %lld\n"
+        "trigger pos = %llu\n",
+        driver_name,
+        writer->total_samples,
+        request->channel_count,
+        writer->block_count,
+        samplerate_str,
+        request->trigger_time_ms,
+        request->trigger_pos);
+    for (c = 0; c < request->channel_count; c++) {
+        const char *probe_name = request->channels[c].name;
+        if (probe_name != NULL && probe_name[0] != '\0') {
+            g_string_append_printf(
+                header,
+                "probe%u = %s\n",
+                (unsigned int)request->channels[c].index,
+                probe_name);
+        } else {
+            g_string_append_printf(
+                header,
+                "probe%u = %u\n",
+                (unsigned int)request->channels[c].index,
+                (unsigned int)request->channels[c].index);
+        }
+    }
+
+    status = dsview_dsl_write_zip_entry(writer->zip_handle, "header", &zi, header->str, header->len);
+    g_string_free(header, TRUE);
+    header = NULL;
+    if (status != SR_OK) {
+        return status;
+    }
+
+    status = dsview_dsl_write_zip_entry(
+        writer->zip_handle,
+        "decoders",
+        &zi,
+        decoders_json,
+        strlen(decoders_json));
+    if (status != SR_OK) {
+        return status;
+    }
+
+    status = dsview_dsl_write_zip_entry(
+        writer->zip_handle,
+        "session",
+        &zi,
+        session_json,
+        strlen(session_json));
+    if (status != SR_OK) {
+        return status;
+    }
+
+    close_err = g_bridge_api.zip_close(writer->zip_handle, NULL);
+    writer->zip_handle = NULL;
+    if (close_err != DSVIEW_ZIP_OK) {
+        return DSVIEW_EXPORT_ERR_RUNTIME;
+    }
+
+    saved_path = strdup(writer->path);
+    out_facts->sample_count = writer->total_samples;
+    out_facts->packet_count = writer->packet_count;
+    out_facts->output_bytes = saved_path != NULL ? dsview_dsl_file_size(saved_path) : 0ULL;
+    free(saved_path);
+
+    return SR_OK;
+}
+
+static int dsview_bridge_stream_dsl_emit_packet(const struct dsview_retained_packet *packet)
+{
+    int status = SR_OK;
+
+    if (!g_streaming_dsl_writer.active) {
+        return SR_OK;
+    }
+    if (g_streaming_dsl_writer.status != SR_OK) {
+        return g_streaming_dsl_writer.status;
+    }
+    if (packet == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+
+    if (packet->type == DSVIEW_EXPORT_PACKET_META) {
+        if (packet->samplerate_hz != 0) {
+            g_streaming_dsl_writer.samplerate_hz = packet->samplerate_hz;
+        }
+    } else if (packet->type == DSVIEW_EXPORT_PACKET_LOGIC) {
+        status = dsview_dsl_writer_push_logic(&g_streaming_dsl_writer, packet);
+        if (status != SR_OK) {
+            g_streaming_dsl_writer.status = status;
+            return status;
+        }
+        g_streaming_dsl_writer.saw_logic_packet = 1;
+    } else if (packet->type == DSVIEW_EXPORT_PACKET_END) {
+        g_streaming_dsl_writer.saw_end_packet = 1;
+        g_streaming_dsl_writer.end_packet_status = packet->status;
+    }
+
+    g_streaming_dsl_writer.packet_count++;
+    return SR_OK;
+}
+
+static int dsview_bridge_export_dsl_from_stream(
+    const struct dsview_dsl_export_request *request,
+    const struct dsview_recorded_stream *stream,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    struct dsview_dsl_writer writer;
+    uint16_t *channel_indices = NULL;
+    unsigned long long samplerate_hz;
+    size_t i;
+    int status;
+
+    if (request == NULL || stream == NULL || path == NULL || path[0] == '\0' || out_facts == NULL
+        || request->channels == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    memset(out_facts, 0, sizeof(*out_facts));
+
+    if (stream->overflowed) {
+        return DSVIEW_EXPORT_ERR_OVERFLOW;
+    }
+    if (!stream->saw_logic_packet || !stream->saw_end_packet) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+    if (stream->end_packet_status != SR_PKT_OK) {
+        return DSVIEW_EXPORT_ERR_BAD_END_STATUS;
+    }
+
+    samplerate_hz = request->samplerate_hz != 0 ? request->samplerate_hz : stream->samplerate_hz;
+    if (samplerate_hz == 0) {
+        return DSVIEW_EXPORT_ERR_MISSING_SAMPLERATE;
+    }
+    if (request->channel_count == 0 || request->channel_count > UINT16_MAX) {
+        return DSVIEW_EXPORT_ERR_NO_ENABLED_CHANNELS;
+    }
+
+    channel_indices = (uint16_t *)calloc(request->channel_count, sizeof(uint16_t));
+    if (channel_indices == NULL) {
+        return SR_ERR_MALLOC;
+    }
+    for (i = 0; i < request->channel_count; i++) {
+        channel_indices[i] = request->channels[i].index;
+    }
+
+    status = dsview_dsl_writer_init(&writer, path, samplerate_hz, channel_indices, request->channel_count);
+    free(channel_indices);
+    if (status != SR_OK) {
+        return status;
+    }
+
+    for (i = 0; i < stream->packet_count; i++) {
+        const struct dsview_retained_packet *pkt = &stream->packets[i];
+        if (pkt->type == DSVIEW_EXPORT_PACKET_META) {
+            if (pkt->samplerate_hz != 0) {
+                writer.samplerate_hz = pkt->samplerate_hz;
+            }
+        } else if (pkt->type == DSVIEW_EXPORT_PACKET_LOGIC) {
+            status = dsview_dsl_writer_push_logic(&writer, pkt);
+            if (status != SR_OK) {
+                dsview_dsl_writer_destroy(&writer);
+                return status;
+            }
+            writer.saw_logic_packet = 1;
+        } else if (pkt->type == DSVIEW_EXPORT_PACKET_END) {
+            writer.saw_end_packet = 1;
+            writer.end_packet_status = pkt->status;
+        }
+        writer.packet_count++;
+    }
+
+    status = dsview_dsl_writer_finish(&writer, request, out_facts);
+    dsview_dsl_writer_destroy(&writer);
+    return status;
+}
+
+int dsview_bridge_ds_recorded_stream_sample_count(unsigned long long *out_sample_count)
+{
+    if (out_sample_count == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    *out_sample_count = 0ULL;
+    if (g_recorded_stream.overflowed) {
+        return DSVIEW_EXPORT_ERR_OVERFLOW;
+    }
+    if (!g_recorded_stream.saw_logic_packet || !g_recorded_stream.saw_end_packet) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+    if (g_recorded_stream.end_packet_status != SR_PKT_OK) {
+        return DSVIEW_EXPORT_ERR_BAD_END_STATUS;
+    }
+    *out_sample_count = g_recorded_stream.sample_count;
+    return SR_OK;
+}
+
+int dsview_bridge_ds_export_recorded_dsl(
+    const struct dsview_dsl_export_request *request,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    return dsview_bridge_export_dsl_from_stream(request, &g_recorded_stream, path, out_facts);
+}
+
+int dsview_bridge_ds_begin_streaming_dsl(
+    unsigned long long samplerate_hz,
+    const uint16_t *enabled_channels,
+    size_t enabled_channel_count,
+    const char *path)
+{
+    dsview_bridge_reset_streaming_dsl_writer();
+    return dsview_dsl_writer_init(
+        &g_streaming_dsl_writer,
+        path,
+        samplerate_hz,
+        enabled_channels,
+        enabled_channel_count);
+}
+
+int dsview_bridge_ds_get_streaming_dsl_progress(struct dsview_dsl_stream_progress *out_progress)
+{
+    size_t flushed_blocks;
+
+    if (out_progress == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    memset(out_progress, 0, sizeof(*out_progress));
+    out_progress->end_packet_status = -1;
+    out_progress->status = DSVIEW_EXPORT_ERR_NO_STREAM;
+
+    if (!g_streaming_dsl_writer.active) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+
+    flushed_blocks = g_streaming_dsl_writer.block_count
+        + (g_streaming_dsl_writer.block_samples > 0 ? 1U : 0U);
+    out_progress->sample_count =
+        g_streaming_dsl_writer.total_samples + (unsigned long long)g_streaming_dsl_writer.block_samples;
+    out_progress->packet_count = g_streaming_dsl_writer.packet_count;
+    out_progress->block_count = flushed_blocks;
+    out_progress->saw_logic_packet = g_streaming_dsl_writer.saw_logic_packet;
+    out_progress->saw_end_packet = g_streaming_dsl_writer.saw_end_packet;
+    out_progress->end_packet_status = g_streaming_dsl_writer.end_packet_status;
+    out_progress->status = g_streaming_dsl_writer.status;
+
+    if (out_progress->status == SR_OK
+        && (!out_progress->saw_logic_packet || !out_progress->saw_end_packet)) {
+        return DSVIEW_EXPORT_ERR_NO_STREAM;
+    }
+    if (out_progress->status == SR_OK && out_progress->end_packet_status != SR_PKT_OK) {
+        return DSVIEW_EXPORT_ERR_BAD_END_STATUS;
+    }
+    return out_progress->status;
+}
+
+int dsview_bridge_ds_finish_streaming_dsl(
+    const struct dsview_dsl_export_request *request,
+    struct dsview_stream_export_facts *out_facts)
+{
+    int status = dsview_dsl_writer_finish(&g_streaming_dsl_writer, request, out_facts);
+    dsview_bridge_reset_streaming_dsl_writer();
+    return status;
+}
+
+void dsview_bridge_ds_abort_streaming_dsl(void)
+{
+    dsview_bridge_reset_streaming_dsl_writer();
+}
+
+static int dsview_bridge_render_dsl_synthetic(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    const size_t *logic_packet_lengths,
+    size_t logic_packet_count,
+    int packet_format,
+    uint16_t unitsize,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    struct dsview_recorded_stream stream;
+    struct dsview_retained_packet *packets = NULL;
+    size_t packet_index;
+    size_t offset = 0;
+    size_t single_packet_len = sample_bytes_len;
+    const size_t *lengths = logic_packet_lengths;
+    size_t count = logic_packet_count;
+    int status;
+
+    if (request == NULL || sample_bytes == NULL || sample_bytes_len == 0 || path == NULL || path[0] == '\0'
+        || out_facts == NULL) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    if (request->channel_count == 0) {
+        return DSVIEW_EXPORT_ERR_NO_ENABLED_CHANNELS;
+    }
+
+    if (lengths == NULL) {
+        lengths = &single_packet_len;
+        count = 1U;
+    } else if (count == 0) {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+
+    if (packet_format == LA_CROSS_DATA) {
+        size_t cross_unitsize = request->channel_count * sizeof(uint64_t);
+        if (cross_unitsize == 0 || (sample_bytes_len % cross_unitsize) != 0) {
+            return DSVIEW_BRIDGE_ERR_ARG;
+        }
+    } else {
+        if (unitsize == 0 || (sample_bytes_len % unitsize) != 0) {
+            return DSVIEW_BRIDGE_ERR_ARG;
+        }
+    }
+
+    memset(&stream, 0, sizeof(stream));
+    packets = (struct dsview_retained_packet *)calloc(count + 2U, sizeof(*packets));
+    if (packets == NULL) {
+        return SR_ERR_MALLOC;
+    }
+
+    packets[0].type = DSVIEW_EXPORT_PACKET_META;
+    packets[0].status = SR_PKT_OK;
+    packets[0].samplerate_hz = request->samplerate_hz;
+
+    for (packet_index = 0; packet_index < count; packet_index++) {
+        size_t pkt_len = lengths[packet_index];
+        size_t alignment = packet_format == LA_CROSS_DATA
+            ? (request->channel_count * sizeof(uint64_t))
+            : (size_t)unitsize;
+        struct dsview_retained_packet *logic_pkt = &packets[packet_index + 1U];
+
+        if (pkt_len == 0 || (pkt_len % alignment) != 0 || offset > sample_bytes_len
+            || pkt_len > sample_bytes_len - offset) {
+            free(packets);
+            return DSVIEW_BRIDGE_ERR_ARG;
+        }
+
+        logic_pkt->type = DSVIEW_EXPORT_PACKET_LOGIC;
+        logic_pkt->status = SR_PKT_OK;
+        logic_pkt->format = packet_format;
+        logic_pkt->length = pkt_len;
+        logic_pkt->unitsize = unitsize;
+        logic_pkt->data = (uint8_t *)(sample_bytes + offset);
+        offset += pkt_len;
+    }
+
+    if (offset != sample_bytes_len) {
+        free(packets);
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+
+    packets[count + 1U].type = DSVIEW_EXPORT_PACKET_END;
+    packets[count + 1U].status = SR_PKT_OK;
+
+    stream.packets = packets;
+    stream.packet_count = count + 2U;
+    stream.saw_logic_packet = 1;
+    stream.saw_end_packet = 1;
+    stream.end_packet_status = SR_PKT_OK;
+    stream.samplerate_hz = request->samplerate_hz;
+    stream.has_samplerate = 1;
+    stream.enabled_channel_count = (uint16_t)request->channel_count;
+
+    status = dsview_bridge_export_dsl_from_stream(request, &stream, path, out_facts);
+    free(packets);
+    return status;
+}
+
+int dsview_bridge_render_dsl_from_samples(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    uint16_t unitsize,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    return dsview_bridge_render_dsl_synthetic(
+        request,
+        sample_bytes,
+        sample_bytes_len,
+        NULL,
+        0,
+        LA_SPLIT_DATA,
+        unitsize,
+        path,
+        out_facts);
+}
+
+int dsview_bridge_render_dsl_from_logic_packets(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    const size_t *logic_packet_lengths,
+    size_t logic_packet_count,
+    uint16_t unitsize,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    return dsview_bridge_render_dsl_synthetic(
+        request,
+        sample_bytes,
+        sample_bytes_len,
+        logic_packet_lengths,
+        logic_packet_count,
+        LA_SPLIT_DATA,
+        unitsize,
+        path,
+        out_facts);
+}
+
+int dsview_bridge_render_dsl_from_cross_logic_packets(
+    const struct dsview_dsl_export_request *request,
+    const uint8_t *sample_bytes,
+    size_t sample_bytes_len,
+    const size_t *logic_packet_lengths,
+    size_t logic_packet_count,
+    const char *path,
+    struct dsview_stream_export_facts *out_facts)
+{
+    return dsview_bridge_render_dsl_synthetic(
+        request,
+        sample_bytes,
+        sample_bytes_len,
+        logic_packet_lengths,
+        logic_packet_count,
+        LA_CROSS_DATA,
+        1,
+        path,
+        out_facts);
+}
+
+int dsview_bridge_ds_device_from_file(const char *file_path)
+{
+    if (file_path == NULL || file_path[0] == '\0') {
+        return DSVIEW_BRIDGE_ERR_ARG;
+    }
+    if (g_bridge_api.ds_device_from_file == NULL) {
+        return DSVIEW_BRIDGE_ERR_NOT_LOADED;
+    }
+
+    return g_bridge_api.ds_device_from_file(file_path);
+}
+
+int dsview_bridge_ds_remove_device(ds_device_handle handle)
+{
+    if (g_bridge_api.ds_remove_device == NULL) {
+        return DSVIEW_BRIDGE_ERR_NOT_LOADED;
+    }
+
+    return g_bridge_api.ds_remove_device(handle);
 }
 
 struct dsview_test_list_item {

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 mod capture_config;
 mod device_option_validation;
 mod device_options;
+mod dsl;
 mod trigger;
 
 pub use capture_config::{
@@ -47,9 +48,13 @@ pub use dsview_sys::{
     AcquisitionSummary, AcquisitionTerminalEvent, DecodeExecutionLogicFormat,
     DecodeOptionValueKind, DecodeRuntimeError, DecodeRuntimeErrorCode, DecodeSessionChannelBinding,
     DecodeSessionInstance, DecodeSessionOption, DecodeSessionOptionValue, DeviceHandle,
-    DeviceSummary, ExportErrorCode, NativeErrorCode, RuntimeError, VcdExportFacts,
-    VcdExportRequest, decode_runtime_library_name, runtime_library_name,
-    source_decode_runtime_library_path, source_runtime_library_path,
+    DeviceSummary, DslChannelSpec, DslExportRequest, DslStreamProgress, ExportErrorCode,
+    NativeErrorCode, RuntimeError, VcdExportFacts, VcdExportRequest, decode_runtime_library_name,
+    runtime_library_name, source_decode_runtime_library_path, source_runtime_library_path,
+};
+pub use dsl::{
+    CaptureOutputPlan, CaptureOutputPlanError, DslSessionMetadataInput, build_dsl_export_request,
+    format_dsl_header_samplerate, resolve_capture_output_plan, write_minimal_store_dsl_zip,
 };
 use dsview_sys::{
     DecodeAnnotation as SysDecodeAnnotation, DecodeAnnotationRow as SysDecodeAnnotationRow,
@@ -1708,6 +1713,7 @@ pub struct CaptureRunSummary {
     pub cleanup: CaptureCleanup,
     pub effective_device_options: Option<EffectiveDeviceOptionState>,
     pub streamed_vcd: Option<StreamedVcdArtifact>,
+    pub streamed_dsl: Option<StreamedDslArtifact>,
     /// Requested trigger and device-reported trigger facts, when a trigger was armed.
     pub trigger: Option<CaptureTriggerOutcome>,
 }
@@ -1716,6 +1722,13 @@ pub struct CaptureRunSummary {
 pub struct StreamedVcdArtifact {
     pub temp_path: PathBuf,
     pub export: VcdExportFacts,
+}
+
+/// Temporary streamed `.dsl` archive awaiting finalized session metadata promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedDslArtifact {
+    pub temp_path: PathBuf,
+    pub sample_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1743,7 +1756,8 @@ pub enum CaptureArtifactPathError {
 pub struct CaptureExportRequest {
     pub capture: CaptureRunSummary,
     pub validated_config: ValidatedCaptureConfig,
-    pub vcd_path: PathBuf,
+    pub vcd_path: Option<PathBuf>,
+    pub dsl_path: Option<PathBuf>,
     pub metadata_path: Option<PathBuf>,
     pub tool_name: String,
     pub tool_version: String,
@@ -1784,7 +1798,10 @@ pub struct MetadataAcquisitionInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MetadataArtifactInfo {
-    pub vcd_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcd_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsl_path: Option<String>,
     pub metadata_path: String,
 }
 
@@ -1803,9 +1820,11 @@ pub struct CaptureMetadata {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureExportSuccess {
-    pub vcd_path: PathBuf,
+    pub vcd_path: Option<PathBuf>,
+    pub dsl_path: Option<PathBuf>,
     pub metadata_path: PathBuf,
     pub export: VcdExportFacts,
+    pub dsl_export: Option<VcdExportFacts>,
     pub metadata: CaptureMetadata,
 }
 
@@ -1821,6 +1840,8 @@ pub enum CaptureExportError {
     CaptureNotExportable { completion: CaptureCompletion },
     #[error(transparent)]
     InvalidArtifactPaths(#[from] CaptureArtifactPathError),
+    #[error(transparent)]
+    InvalidOutputPlan(#[from] CaptureOutputPlanError),
     #[error("export failed for `{path}` with {kind:?}: {detail}")]
     ExportFailed {
         path: PathBuf,
@@ -1841,6 +1862,7 @@ pub struct CaptureRunRequest {
     pub stop_after: Option<Duration>,
     pub stop_on_interrupt: Option<Arc<AtomicBool>>,
     pub stream_vcd_path: Option<PathBuf>,
+    pub stream_dsl_path: Option<PathBuf>,
     /// Hardware trigger to arm; requires `validated_device_options`.
     pub trigger: Option<ValidatedTrigger>,
     pub wait_timeout: Duration,
@@ -2278,9 +2300,17 @@ pub fn apply_validated_device_options(
 ///
 /// A failed stream capture, for example one whose trigger never fired, must not
 /// leave a truncated `*.streaming.tmp` file next to the requested output.
-fn discard_streaming_vcd(runtime: &RuntimeBridge, stream_vcd_path: Option<&Path>) {
+fn discard_streaming_artifacts(
+    runtime: &RuntimeBridge,
+    stream_vcd_path: Option<&Path>,
+    stream_dsl_path: Option<&Path>,
+) {
     if let Some(path) = stream_vcd_path {
         runtime.abort_streaming_vcd();
+        let _ = fs::remove_file(path);
+    }
+    if let Some(path) = stream_dsl_path {
+        runtime.abort_streaming_dsl();
         let _ = fs::remove_file(path);
     }
 }
@@ -2535,7 +2565,7 @@ impl Discovery {
         selection_handle: SelectionHandle,
         config: &ValidatedCaptureConfig,
     ) -> Result<CaptureSession<'_>, CaptureRunError> {
-        self.prepare_capture_session_with_streaming(selection_handle, config, None)
+        self.prepare_capture_session_with_streaming(selection_handle, config, None, None)
     }
 
     fn prepare_capture_session_with_streaming(
@@ -2543,6 +2573,7 @@ impl Discovery {
         selection_handle: SelectionHandle,
         config: &ValidatedCaptureConfig,
         stream_vcd_path: Option<&Path>,
+        stream_dsl_path: Option<&Path>,
     ) -> Result<CaptureSession<'_>, CaptureRunError> {
         let request = CaptureConfigRequest {
             sample_rate_hz: config.sample_rate_hz,
@@ -2566,27 +2597,40 @@ impl Discovery {
         self.runtime
             .reset_acquisition_summary()
             .map_err(BringUpError::Runtime)?;
-        self.begin_streaming_vcd_if_requested(&request, stream_vcd_path)?;
+        self.begin_streaming_outputs_if_requested(&request, stream_vcd_path, stream_dsl_path)?;
         if let Err(error) = self.runtime.register_acquisition_callbacks() {
-            discard_streaming_vcd(&self.runtime, stream_vcd_path);
+            discard_streaming_artifacts(&self.runtime, stream_vcd_path, stream_dsl_path);
             return Err(BringUpError::Runtime(error).into());
         }
         Ok(CaptureSession { opened })
     }
 
-    fn begin_streaming_vcd_if_requested(
+    fn begin_streaming_outputs_if_requested(
         &self,
         request: &CaptureConfigRequest,
         stream_vcd_path: Option<&Path>,
+        stream_dsl_path: Option<&Path>,
     ) -> Result<(), BringUpError> {
+        let enabled_channels: Vec<u16> = request.enabled_channels.iter().copied().collect();
         if let Some(path) = stream_vcd_path {
             let export_request = VcdExportRequest {
                 samplerate_hz: request.sample_rate_hz,
-                enabled_channels: request.enabled_channels.iter().copied().collect(),
+                enabled_channels: enabled_channels.clone(),
             };
-            self.runtime
-                .begin_streaming_vcd_to_path(&export_request, path)
-                .map_err(BringUpError::Runtime)?;
+            if let Err(error) = self.runtime.begin_streaming_vcd_to_path(&export_request, path) {
+                let _ = fs::remove_file(path);
+                return Err(BringUpError::Runtime(error));
+            }
+        }
+        if let Some(path) = stream_dsl_path {
+            if let Err(error) = self.runtime.begin_streaming_dsl_to_path(
+                request.sample_rate_hz,
+                &enabled_channels,
+                path,
+            ) {
+                discard_streaming_artifacts(&self.runtime, stream_vcd_path, Some(path));
+                return Err(BringUpError::Runtime(error));
+            }
         }
         Ok(())
     }
@@ -2616,9 +2660,34 @@ impl Discovery {
         self.runtime
             .reset_acquisition_summary()
             .map_err(BringUpError::Runtime)?;
-        self.begin_streaming_vcd_if_requested(&request.config, request.stream_vcd_path.as_deref())?;
+        let streaming_config = CaptureConfigRequest {
+            sample_rate_hz: effective_device_options
+                .sample_rate_hz
+                .unwrap_or(request.config.sample_rate_hz),
+            sample_limit: effective_device_options
+                .sample_limit
+                .unwrap_or(request.config.sample_limit),
+            enabled_channels: if effective_device_options.enabled_channels.is_empty() {
+                request.config.enabled_channels.clone()
+            } else {
+                effective_device_options
+                    .enabled_channels
+                    .iter()
+                    .copied()
+                    .collect()
+            },
+        };
+        self.begin_streaming_outputs_if_requested(
+            &streaming_config,
+            request.stream_vcd_path.as_deref(),
+            request.stream_dsl_path.as_deref(),
+        )?;
         if let Err(error) = self.runtime.register_acquisition_callbacks() {
-            discard_streaming_vcd(&self.runtime, request.stream_vcd_path.as_deref());
+            discard_streaming_artifacts(
+                &self.runtime,
+                request.stream_vcd_path.as_deref(),
+                request.stream_dsl_path.as_deref(),
+            );
             return Err(BringUpError::Runtime(error).into());
         }
         Ok((CaptureSession { opened }, effective_device_options))
@@ -2658,6 +2727,7 @@ impl Discovery {
                 request.selection_handle,
                 &validated,
                 request.stream_vcd_path.as_deref(),
+                request.stream_dsl_path.as_deref(),
             )?;
             (session, None)
         };
@@ -2668,7 +2738,11 @@ impl Discovery {
             .map_err(BringUpError::Runtime)?;
         if !started.start_status.is_ok() {
             let cleanup = session.cleanup(&self.runtime, true);
-            discard_streaming_vcd(&self.runtime, request.stream_vcd_path.as_deref());
+            discard_streaming_artifacts(
+                &self.runtime,
+                request.stream_vcd_path.as_deref(),
+                request.stream_dsl_path.as_deref(),
+            );
             return Err(if cleanup.succeeded() {
                 CaptureRunError::StartFailed {
                     code: started.start_status,
@@ -2764,7 +2838,11 @@ impl Discovery {
             });
 
         if !cleanup.succeeded() {
-            discard_streaming_vcd(&self.runtime, request.stream_vcd_path.as_deref());
+            discard_streaming_artifacts(
+                &self.runtime,
+                request.stream_vcd_path.as_deref(),
+                request.stream_dsl_path.as_deref(),
+            );
             return Err(CaptureRunError::CleanupFailed {
                 during: capture_completion_stage(completion),
                 summary,
@@ -2772,21 +2850,61 @@ impl Discovery {
             });
         }
 
-        let streamed_vcd = if let Some(path) = request.stream_vcd_path.as_ref() {
-            match completion {
-                CaptureCompletion::CleanSuccess
+        let is_clean_completion = matches!(
+            completion,
+            CaptureCompletion::CleanSuccess
                 | CaptureCompletion::StoppedByDuration
-                | CaptureCompletion::StoppedByInterrupt => Some(StreamedVcdArtifact {
-                    temp_path: path.clone(),
-                    export: self
-                        .runtime
-                        .finish_streaming_vcd()
-                        .map_err(BringUpError::Runtime)?,
-                }),
-                _ => {
-                    discard_streaming_vcd(&self.runtime, Some(path.as_path()));
-                    None
+                | CaptureCompletion::StoppedByInterrupt
+        );
+        if !is_clean_completion {
+            discard_streaming_artifacts(
+                &self.runtime,
+                request.stream_vcd_path.as_deref(),
+                request.stream_dsl_path.as_deref(),
+            );
+        }
+
+        let streamed_vcd = if is_clean_completion {
+            if let Some(path) = request.stream_vcd_path.as_ref() {
+                match self.runtime.finish_streaming_vcd() {
+                    Ok(export) => Some(StreamedVcdArtifact {
+                        temp_path: path.clone(),
+                        export,
+                    }),
+                    Err(error) => {
+                        let _ = fs::remove_file(path);
+                        discard_streaming_artifacts(
+                            &self.runtime,
+                            None,
+                            request.stream_dsl_path.as_deref(),
+                        );
+                        return Err(BringUpError::Runtime(error).into());
+                    }
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let streamed_dsl = if is_clean_completion {
+            if let Some(path) = request.stream_dsl_path.as_ref() {
+                match self.runtime.streaming_dsl_progress() {
+                    Ok(progress) => Some(StreamedDslArtifact {
+                        temp_path: path.clone(),
+                        sample_count: progress.sample_count,
+                    }),
+                    Err(error) => {
+                        if let Some(vcd) = streamed_vcd.as_ref() {
+                            let _ = fs::remove_file(&vcd.temp_path);
+                        }
+                        discard_streaming_artifacts(&self.runtime, None, Some(path.as_path()));
+                        return Err(BringUpError::Runtime(error).into());
+                    }
+                }
+            } else {
+                None
             }
         } else {
             None
@@ -2801,6 +2919,7 @@ impl Discovery {
                 cleanup,
                 effective_device_options,
                 streamed_vcd,
+                streamed_dsl,
                 trigger,
             }),
             CaptureCompletion::StartFailure => Err(CaptureRunError::StartFailed {
@@ -3322,12 +3441,12 @@ pub fn build_capture_device_option_facts(
     }
 }
 
-fn build_capture_metadata(
+fn build_capture_metadata_with_facts(
     request: &CaptureExportRequest,
-    metadata_path: &Path,
-    export: &VcdExportFacts,
+    plan: &CaptureOutputPlan,
+    sample_count: u64,
+    device_options: CaptureDeviceOptionFacts,
 ) -> Result<CaptureMetadata, String> {
-    let device_options = build_capture_device_option_facts(request)?;
     Ok(CaptureMetadata {
         schema_version: 2,
         tool: MetadataToolInfo {
@@ -3341,7 +3460,7 @@ fn build_capture_metadata(
             selected_handle: request.selected_handle.raw(),
             sample_rate_hz: request.validated_config.sample_rate_hz,
             requested_sample_limit: request.validated_config.requested_sample_limit,
-            actual_sample_count: export.sample_count,
+            actual_sample_count: sample_count,
             enabled_channels: request.validated_config.enabled_channels.clone(),
         },
         acquisition: MetadataAcquisitionInfo {
@@ -3352,12 +3471,28 @@ fn build_capture_metadata(
             end_packet_status: end_packet_status_name(request.capture.summary.end_packet_status),
         },
         artifacts: MetadataArtifactInfo {
-            vcd_path: request.vcd_path.display().to_string(),
-            metadata_path: metadata_path.display().to_string(),
+            vcd_path: plan.vcd_path.as_ref().map(|path| path.display().to_string()),
+            dsl_path: plan.dsl_path.as_ref().map(|path| path.display().to_string()),
+            metadata_path: plan.metadata_path.display().to_string(),
         },
         device_options,
         trigger: request.capture.trigger.as_ref().map(TriggerReport::from_outcome),
     })
+}
+
+#[cfg(test)]
+fn build_capture_metadata(
+    request: &CaptureExportRequest,
+    metadata_path: &Path,
+    export: &VcdExportFacts,
+) -> Result<CaptureMetadata, String> {
+    let device_options = build_capture_device_option_facts(request)?;
+    let plan = CaptureOutputPlan {
+        vcd_path: request.vcd_path.clone(),
+        dsl_path: request.dsl_path.clone(),
+        metadata_path: metadata_path.to_path_buf(),
+    };
+    build_capture_metadata_with_facts(request, &plan, export.sample_count, device_options)
 }
 
 fn write_metadata_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -3381,10 +3516,10 @@ fn write_metadata_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn promote_streamed_vcd(temp_path: &Path, final_path: &Path) -> Result<(), String> {
+fn promote_streamed_artifact(temp_path: &Path, final_path: &Path, label: &str) -> Result<(), String> {
     let parent = final_path.parent().ok_or_else(|| {
         format!(
-            "VCD path `{}` has no parent directory",
+            "{label} path `{}` has no parent directory",
             final_path.display()
         )
     })?;
@@ -3398,8 +3533,70 @@ fn promote_streamed_vcd(temp_path: &Path, final_path: &Path) -> Result<(), Strin
     Ok(())
 }
 
+fn resolve_export_paths(request: &CaptureExportRequest) -> Result<CaptureOutputPlan, CaptureExportError> {
+    match (request.vcd_path.as_ref(), request.dsl_path.as_ref()) {
+        (Some(vcd_path), dsl_path_opt) => {
+            let vcd_artifacts =
+                resolve_capture_artifact_paths(vcd_path, request.metadata_path.as_ref())?;
+            if let Some(dsl_path) = dsl_path_opt {
+                if dsl_path.extension().and_then(|ext| ext.to_str()) != Some("dsl") {
+                    return Err(CaptureExportError::InvalidOutputPlan(
+                        CaptureOutputPlanError::InvalidDslExtension {
+                            path: dsl_path.clone(),
+                        },
+                    ));
+                }
+                if dsl_path == &vcd_artifacts.vcd_path {
+                    return Err(CaptureExportError::InvalidOutputPlan(
+                        CaptureOutputPlanError::ConflictingArtifactPaths {
+                            left: vcd_artifacts.vcd_path,
+                            right: dsl_path.clone(),
+                        },
+                    ));
+                }
+                if dsl_path == &vcd_artifacts.metadata_path {
+                    return Err(CaptureExportError::InvalidOutputPlan(
+                        CaptureOutputPlanError::ConflictingArtifactPaths {
+                            left: dsl_path.clone(),
+                            right: vcd_artifacts.metadata_path,
+                        },
+                    ));
+                }
+            }
+            Ok(CaptureOutputPlan {
+                vcd_path: Some(vcd_artifacts.vcd_path),
+                dsl_path: dsl_path_opt.cloned(),
+                metadata_path: vcd_artifacts.metadata_path,
+            })
+        }
+        (None, dsl_path_opt) => {
+            resolve_capture_output_plan(None::<&Path>, dsl_path_opt, request.metadata_path.as_ref())
+                .map_err(CaptureExportError::from)
+        }
+    }
+}
+
 impl Discovery {
-    pub fn export_clean_capture_vcd(
+    fn cleanup_unpromoted_streamed_artifacts(
+        &self,
+        capture: &CaptureRunSummary,
+        promoted_vcd: bool,
+        promoted_dsl: bool,
+    ) {
+        if !promoted_vcd {
+            if let Some(streamed_vcd) = capture.streamed_vcd.as_ref() {
+                let _ = fs::remove_file(&streamed_vcd.temp_path);
+            }
+        }
+        if !promoted_dsl {
+            if let Some(streamed_dsl) = capture.streamed_dsl.as_ref() {
+                self.runtime.abort_streaming_dsl();
+                let _ = fs::remove_file(&streamed_dsl.temp_path);
+            }
+        }
+    }
+
+    pub fn export_clean_capture(
         &self,
         request: &CaptureExportRequest,
     ) -> Result<CaptureExportSuccess, CaptureExportError> {
@@ -3409,60 +3606,199 @@ impl Discovery {
                 | CaptureCompletion::StoppedByDuration
                 | CaptureCompletion::StoppedByInterrupt
         ) {
+            self.cleanup_unpromoted_streamed_artifacts(&request.capture, false, false);
             return Err(CaptureExportError::CaptureNotExportable {
                 completion: request.capture.completion,
             });
         }
 
-        let export_request = build_vcd_export_request(&request.validated_config);
-        let artifact_paths =
-            resolve_capture_artifact_paths(&request.vcd_path, request.metadata_path.as_ref())?;
-        let vcd_path = artifact_paths.vcd_path;
-        let metadata_path = artifact_paths.metadata_path;
-        let export = if let Some(streamed_vcd) = request.capture.streamed_vcd.as_ref() {
-            promote_streamed_vcd(&streamed_vcd.temp_path, &vcd_path).map_err(|detail| {
-                CaptureExportError::ExportFailed {
-                    path: vcd_path.clone(),
-                    kind: CaptureExportFailureKind::Runtime,
-                    detail,
-                }
-            })?;
-            streamed_vcd.export.clone()
-        } else {
-            self.runtime
-                .export_recorded_vcd_to_path(&export_request, &vcd_path)
-                .map_err(|error| CaptureExportError::ExportFailed {
-                    path: vcd_path.clone(),
-                    kind: export_failure_kind(&error),
-                    detail: error.to_string(),
-                })?
+        let plan = match resolve_export_paths(request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.cleanup_unpromoted_streamed_artifacts(&request.capture, false, false);
+                return Err(error);
+            }
         };
-        let metadata =
-            build_capture_metadata(request, &metadata_path, &export).map_err(|detail| {
-                CaptureExportError::MetadataSerializationFailed {
-                    path: metadata_path.clone(),
+
+        let device_options = match build_capture_device_option_facts(request) {
+            Ok(facts) => facts,
+            Err(detail) => {
+                self.cleanup_unpromoted_streamed_artifacts(&request.capture, false, false);
+                return Err(CaptureExportError::MetadataSerializationFailed {
+                    path: plan.metadata_path,
                     detail,
+                });
+            }
+        };
+
+        let mut promoted_vcd = false;
+        let vcd_export = if let Some(vcd_path) = plan.vcd_path.as_ref() {
+            let export_result = if let Some(streamed_vcd) = request.capture.streamed_vcd.as_ref() {
+                promote_streamed_artifact(&streamed_vcd.temp_path, vcd_path, "VCD")
+                    .map(|()| {
+                        promoted_vcd = true;
+                        streamed_vcd.export.clone()
+                    })
+                    .map_err(|detail| CaptureExportError::ExportFailed {
+                        path: vcd_path.clone(),
+                        kind: CaptureExportFailureKind::Runtime,
+                        detail,
+                    })
+            } else {
+                let vcd_request = build_vcd_export_request(&request.validated_config);
+                self.runtime
+                    .export_recorded_vcd_to_path(&vcd_request, vcd_path)
+                    .map_err(|error| CaptureExportError::ExportFailed {
+                        path: vcd_path.clone(),
+                        kind: export_failure_kind(&error),
+                        detail: error.to_string(),
+                    })
+            };
+
+            match export_result {
+                Ok(facts) => Some(facts),
+                Err(error) => {
+                    self.cleanup_unpromoted_streamed_artifacts(&request.capture, promoted_vcd, false);
+                    return Err(error);
                 }
-            })?;
+            }
+        } else {
+            // Discard any unused streamed VCD temp file when only DSL export is requested.
+            if let Some(streamed_vcd) = request.capture.streamed_vcd.as_ref() {
+                let _ = fs::remove_file(&streamed_vcd.temp_path);
+            }
+            None
+        };
+
+        let mut promoted_dsl = false;
+        let dsl_export = if let Some(dsl_path) = plan.dsl_path.as_ref() {
+            let sample_count = if let Some(streamed_dsl) = request.capture.streamed_dsl.as_ref() {
+                streamed_dsl.sample_count
+            } else if let Some(vcd) = vcd_export.as_ref() {
+                vcd.sample_count
+            } else {
+                match self.runtime.recorded_stream_sample_count() {
+                    Ok(count) => count,
+                    Err(error) => {
+                        self.cleanup_unpromoted_streamed_artifacts(
+                            &request.capture,
+                            promoted_vcd,
+                            false,
+                        );
+                        return Err(CaptureExportError::ExportFailed {
+                            path: dsl_path.clone(),
+                            kind: export_failure_kind(&error),
+                            detail: error.to_string(),
+                        });
+                    }
+                }
+            };
+
+            let title = format!("{} v{}", request.tool_name, request.tool_version);
+            let dsl_request = build_dsl_export_request(&DslSessionMetadataInput {
+                title: &title,
+                device_model: &request.device_model,
+                samplerate_hz: request.validated_config.sample_rate_hz,
+                sample_count,
+                enabled_channels: &request.validated_config.enabled_channels,
+                capture_started_at: request.capture_started_at,
+                device_options_snapshot: &request.device_options_snapshot,
+                effective_options: &device_options.effective,
+                trigger: request.capture.trigger.as_ref(),
+            });
+
+            let export_result = if let Some(streamed_dsl) = request.capture.streamed_dsl.as_ref() {
+                match self.runtime.finish_streaming_dsl(&dsl_request) {
+                    Ok(facts) => promote_streamed_artifact(&streamed_dsl.temp_path, dsl_path, "DSL")
+                        .map(|()| {
+                            promoted_dsl = true;
+                            facts
+                        })
+                        .map_err(|detail| CaptureExportError::ExportFailed {
+                            path: dsl_path.clone(),
+                            kind: CaptureExportFailureKind::Runtime,
+                            detail,
+                        }),
+                    Err(error) => {
+                        let _ = fs::remove_file(&streamed_dsl.temp_path);
+                        Err(CaptureExportError::ExportFailed {
+                            path: dsl_path.clone(),
+                            kind: export_failure_kind(&error),
+                            detail: error.to_string(),
+                        })
+                    }
+                }
+            } else {
+                self.runtime
+                    .export_recorded_dsl_to_path(&dsl_request, dsl_path)
+                    .map_err(|error| CaptureExportError::ExportFailed {
+                        path: dsl_path.clone(),
+                        kind: export_failure_kind(&error),
+                        detail: error.to_string(),
+                    })
+            };
+
+            match export_result {
+                Ok(facts) => Some(facts),
+                Err(error) => {
+                    self.cleanup_unpromoted_streamed_artifacts(
+                        &request.capture,
+                        promoted_vcd,
+                        promoted_dsl,
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            if let Some(streamed_dsl) = request.capture.streamed_dsl.as_ref() {
+                self.runtime.abort_streaming_dsl();
+                let _ = fs::remove_file(&streamed_dsl.temp_path);
+            }
+            None
+        };
+
+        let primary_export = vcd_export
+            .or_else(|| dsl_export.clone())
+            .expect("at least one export artifact must be present");
+
+        let metadata = build_capture_metadata_with_facts(
+            request,
+            &plan,
+            primary_export.sample_count,
+            device_options,
+        )
+        .map_err(|detail| CaptureExportError::MetadataSerializationFailed {
+            path: plan.metadata_path.clone(),
+            detail,
+        })?;
         let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
             CaptureExportError::MetadataSerializationFailed {
-                path: metadata_path.clone(),
+                path: plan.metadata_path.clone(),
                 detail: error.to_string(),
             }
         })?;
-        write_metadata_atomically(&metadata_path, &metadata_bytes).map_err(|detail| {
+        write_metadata_atomically(&plan.metadata_path, &metadata_bytes).map_err(|detail| {
             CaptureExportError::MetadataWriteFailed {
-                path: metadata_path.clone(),
+                path: plan.metadata_path.clone(),
                 detail,
             }
         })?;
 
         Ok(CaptureExportSuccess {
-            vcd_path,
-            metadata_path,
-            export,
+            vcd_path: plan.vcd_path,
+            dsl_path: plan.dsl_path,
+            metadata_path: plan.metadata_path,
+            export: primary_export,
+            dsl_export,
             metadata,
         })
+    }
+
+    pub fn export_clean_capture_vcd(
+        &self,
+        request: &CaptureExportRequest,
+    ) -> Result<CaptureExportSuccess, CaptureExportError> {
+        self.export_clean_capture(request)
     }
 }
 
@@ -3904,6 +4240,7 @@ mod tests {
                 },
                 effective_device_options: None,
                 streamed_vcd: None,
+                streamed_dsl: None,
                 trigger: None,
             },
             validated_config: ValidatedCaptureConfig {
@@ -3913,7 +4250,8 @@ mod tests {
                 enabled_channels: vec![0, 1, 2, 3],
                 channel_mode_id: 20,
             },
-            vcd_path,
+            vcd_path: Some(vcd_path),
+            dsl_path: None,
             metadata_path: None,
             tool_name: "dsview-cli".to_string(),
             tool_version: "1.2.4".to_string(),
@@ -4108,8 +4446,9 @@ mod tests {
 
     #[test]
     fn build_capture_metadata_uses_export_sample_count_and_normal_end_shape() {
-        let request = export_request(PathBuf::from("/tmp/capture.vcd"));
-        let metadata_path = metadata_path_for_vcd(&request.vcd_path);
+        let vcd_path = PathBuf::from("/tmp/capture.vcd");
+        let request = export_request(vcd_path.clone());
+        let metadata_path = metadata_path_for_vcd(&vcd_path);
         let export = VcdExportFacts {
             sample_count: 1536,
             packet_count: 4,
@@ -4128,8 +4467,44 @@ mod tests {
             metadata.acquisition.end_packet_status.as_deref(),
             Some("ok")
         );
-        assert_eq!(metadata.artifacts.vcd_path, "/tmp/capture.vcd");
+        assert_eq!(
+            metadata.artifacts.vcd_path.as_deref(),
+            Some("/tmp/capture.vcd")
+        );
+        assert_eq!(metadata.artifacts.dsl_path, None);
         assert_eq!(metadata.artifacts.metadata_path, "/tmp/capture.json");
+    }
+
+    #[test]
+    fn dsl_only_metadata_artifacts_omit_vcd_path_in_serialized_json() {
+        let mut request = export_request(PathBuf::from("/tmp/capture.vcd"));
+        request.vcd_path = None;
+        request.dsl_path = Some(PathBuf::from("/tmp/capture.dsl"));
+        let metadata_path = PathBuf::from("/tmp/capture.json");
+        let export = VcdExportFacts {
+            sample_count: 1536,
+            packet_count: 4,
+            output_bytes: 768,
+        };
+
+        let metadata = build_capture_metadata(&request, &metadata_path, &export).unwrap();
+        let json: serde_json::Value = serde_json::to_value(&metadata).unwrap();
+        let artifacts = json
+            .get("artifacts")
+            .and_then(|value| value.as_object())
+            .expect("artifacts object must exist");
+
+        assert!(artifacts.get("vcd_path").is_none());
+        assert_eq!(
+            artifacts.get("dsl_path").and_then(|value| value.as_str()),
+            Some("/tmp/capture.dsl")
+        );
+        assert_eq!(
+            artifacts
+                .get("metadata_path")
+                .and_then(|value| value.as_str()),
+            Some("/tmp/capture.json")
+        );
     }
 
     #[test]

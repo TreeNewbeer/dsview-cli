@@ -74,14 +74,15 @@ fn capture_help_mentions_bundled_resource_override_and_artifact_controls() {
         .stdout(predicate::str::contains("--channels <IDX[,IDX...]>"))
         .stdout(predicate::str::contains("Comma-separated logic channel indexes to enable"))
         .stdout(predicate::str::contains("--output <PATH>"))
+        .stdout(predicate::str::contains("--dsl-output <PATH>"))
         .stdout(predicate::str::contains("--metadata-output <PATH>"))
         .stdout(predicate::str::contains("--wait-timeout-ms <WAIT_TIMEOUT_MS>"))
         .stdout(predicate::str::contains("Maximum time to wait for capture completion before aborting"))
         .stdout(predicate::str::contains("--poll-interval-ms <POLL_INTERVAL_MS>"))
         .stdout(predicate::str::contains("Polling interval for checking capture progress while waiting"))
         .stdout(predicate::str::contains("json is stable for automation"))
-        .stdout(predicate::str::contains("must end with .vcd"))
-        .stdout(predicate::str::contains("defaults to the VCD path with a .json extension"))
+        .stdout(predicate::str::contains("must end with .vcd or .dsl"))
+        .stdout(predicate::str::contains("defaults to the primary output path with a .json extension"))
         .stdout(predicate::str::contains("--library").not())
         .stdout(predicate::str::contains("--use-source-runtime").not());
 }
@@ -154,7 +155,7 @@ fn capture_accepts_all_device_option_flags_before_runtime_validation() {
         .failure()
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("capture_output_path_invalid:"))
-        .stderr(predicate::str::contains("must use the .vcd extension"))
+        .stderr(predicate::str::contains("must use the .vcd or .dsl extension"))
         .stderr(predicate::str::contains("unexpected argument").not())
         .stderr(predicate::str::contains("invalid value").not());
 }
@@ -377,7 +378,7 @@ fn capture_invalid_output_path_fails_on_stderr_in_text_mode() {
         .failure()
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("capture_output_path_invalid:"))
-        .stderr(predicate::str::contains("must use the .vcd extension"));
+        .stderr(predicate::str::contains("must use the .vcd or .dsl extension"));
 }
 
 #[test]
@@ -689,4 +690,257 @@ fn capture_without_overrides_reports_inherited_effective_device_options() {
         metadata["device_options"]["requested"],
         metadata["device_options"]["effective"]
     );
+}
+
+fn parse_store_zip_entries(zip_bytes: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut entries = std::collections::BTreeMap::new();
+    let mut offset = 0usize;
+    while offset + 30 <= zip_bytes.len() && zip_bytes[offset..offset + 4] == [0x50, 0x4b, 0x03, 0x04] {
+        let compression = u16::from_le_bytes([zip_bytes[offset + 8], zip_bytes[offset + 9]]);
+        assert_eq!(compression, 0, "fixture .dsl should use STORE compression");
+        let comp_size = u32::from_le_bytes([
+            zip_bytes[offset + 18],
+            zip_bytes[offset + 19],
+            zip_bytes[offset + 20],
+            zip_bytes[offset + 21],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([zip_bytes[offset + 26], zip_bytes[offset + 27]]) as usize;
+        let extra_len =
+            u16::from_le_bytes([zip_bytes[offset + 28], zip_bytes[offset + 29]]) as usize;
+        let name_start = offset + 30;
+        let data_start = name_start + name_len + extra_len;
+        let data_end = data_start + comp_size;
+        let name = String::from_utf8(zip_bytes[name_start..name_start + name_len].to_vec())
+            .expect("zip entry name should be UTF-8");
+        entries.insert(name, zip_bytes[data_start..data_end].to_vec());
+        offset = data_end;
+    }
+    entries
+}
+
+#[test]
+fn capture_output_dsl_writes_dsl_and_derived_metadata_without_vcd() {
+    let (vcd_placeholder, _) = unique_capture_paths("dsl-primary");
+    let dsl_path = vcd_placeholder.with_extension("dsl");
+    let metadata_path = dsl_path.with_extension("json");
+
+    let output = mock_cli_command()
+        .args([
+            "capture",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,1,2,3",
+            "--output",
+            dsl_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload = parse_json(&output);
+    assert!(payload["artifacts"].get("vcd_path").is_none());
+    assert_eq!(payload["artifacts"]["dsl_path"], dsl_path.display().to_string());
+    assert_eq!(
+        payload["artifacts"]["metadata_path"],
+        metadata_path.display().to_string()
+    );
+    assert!(!vcd_placeholder.exists());
+    assert!(dsl_path.exists());
+    assert!(metadata_path.exists());
+
+    let metadata = parse_json(&fs::read(&metadata_path).expect("metadata JSON should exist"));
+    assert!(metadata["artifacts"].get("vcd_path").is_none());
+    assert_eq!(
+        metadata["artifacts"]["dsl_path"],
+        dsl_path.display().to_string()
+    );
+
+    let zip_bytes = fs::read(&dsl_path).expect("DSL archive should be readable");
+    let entries = parse_store_zip_entries(&zip_bytes);
+    for expected in ["L-0/0", "L-1/0", "L-2/0", "L-3/0", "header", "decoders", "session"] {
+        assert!(
+            entries.contains_key(expected),
+            "missing ZIP entry `{expected}`"
+        );
+    }
+
+    let header_text = String::from_utf8(entries["header"].clone()).unwrap();
+    assert!(header_text.contains("total samples = 2048"));
+    assert!(header_text.contains("total probes = 4"));
+    assert!(header_text.contains("samplerate = 100 MHz"));
+
+    let session_json: Value = serde_json::from_slice(&entries["session"]).unwrap();
+    assert_eq!(session_json["Version"], 3);
+    assert_eq!(session_json["Sample count"], "2048");
+    assert_eq!(session_json["channel"].as_array().unwrap().len(), 4);
+
+    if let Some(runtime_path) = dsview_sys::source_runtime_library_path() {
+        let runtime = dsview_sys::RuntimeBridge::load(&runtime_path)
+            .expect("source runtime should load for virtual-session check");
+        let _ = runtime.exit();
+        runtime.init().expect("runtime init should succeed");
+        runtime
+            .device_from_file(&dsl_path)
+            .expect("CLI-generated .dsl archive should load via ds_device_from_file");
+        let file_name = dsl_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("dsl filename should be UTF-8");
+        let devices = runtime.list_devices().expect("list_devices should succeed");
+        let dev = devices
+            .iter()
+            .find(|device| device.name.contains(file_name) || device.name.contains(".dsl"))
+            .expect("virtual-session device should appear in device list");
+        runtime
+            .open_device(dev.handle)
+            .expect("opening virtual-session should succeed");
+        assert_eq!(runtime.current_samplerate().unwrap(), Some(100_000_000));
+        assert_eq!(runtime.current_sample_limit().unwrap(), Some(2048));
+        runtime.release_device().unwrap();
+        runtime.remove_device(dev.handle).unwrap();
+        runtime.exit().unwrap();
+    }
+}
+
+#[test]
+fn capture_dsl_output_flag_without_output_writes_dsl_and_text_summary() {
+    let (vcd_placeholder, _) = unique_capture_paths("dsl-flag-only");
+    let dsl_path = vcd_placeholder.with_extension("dsl");
+    let metadata_path = dsl_path.with_extension("json");
+
+    let output = mock_cli_command()
+        .args([
+            "capture",
+            "--format",
+            "text",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,1",
+            "--dsl-output",
+            dsl_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).expect("text output should be UTF-8");
+    assert!(!text.contains("\nvcd "));
+    assert!(text.contains(&format!("dsl {}", dsl_path.display())));
+    assert!(text.contains(&format!("metadata {}", metadata_path.display())));
+    assert!(dsl_path.exists());
+    assert!(metadata_path.exists());
+}
+
+#[test]
+fn capture_dual_vcd_and_dsl_outputs_both_artifacts_and_metadata() {
+    let (vcd_path, metadata_path) = unique_capture_paths("dual-outputs");
+    let dsl_path = vcd_path.with_extension("dsl");
+
+    let output = mock_cli_command()
+        .args([
+            "capture",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,2",
+            "--output",
+            vcd_path.to_str().unwrap(),
+            "--dsl-output",
+            dsl_path.to_str().unwrap(),
+            "--metadata-output",
+            metadata_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let payload = parse_json(&output);
+    assert_eq!(payload["artifacts"]["vcd_path"], vcd_path.display().to_string());
+    assert_eq!(payload["artifacts"]["dsl_path"], dsl_path.display().to_string());
+    assert_eq!(
+        payload["artifacts"]["metadata_path"],
+        metadata_path.display().to_string()
+    );
+    assert!(vcd_path.exists());
+    assert!(dsl_path.exists());
+    assert!(metadata_path.exists());
+}
+
+#[test]
+fn capture_rejects_duplicate_dsl_output_invalid_dsl_extension_and_missing_outputs() {
+    cli_command()
+        .args([
+            "capture",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,1",
+            "--output",
+            "artifacts/run.dsl",
+            "--dsl-output",
+            "artifacts/other.dsl",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"code\": \"capture_duplicate_dsl_output\""));
+
+    cli_command()
+        .args([
+            "capture",
+            "--format",
+            "text",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,1",
+            "--dsl-output",
+            "artifacts/run.bin",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("capture_dsl_output_path_invalid:"));
+
+    cli_command()
+        .args([
+            "capture",
+            "--handle",
+            "7",
+            "--sample-rate-hz",
+            "100000000",
+            "--sample-limit",
+            "2048",
+            "--channels",
+            "0,1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--output <PATH>"));
 }

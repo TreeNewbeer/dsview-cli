@@ -8,8 +8,9 @@ use dsview_sys::{
     source_decode_runtime_library_path, source_runtime_library_path, upstream_header_path,
     DecodeDecoder, DecodeExecutionLogicFormat, DecodeExecutionSession, DecodeRuntimeBridge,
     DecodeOptionValueKind, DecodeRuntimeError, DecodeRuntimeErrorCode, DecodeSessionChannelBinding,
-    DecodeSessionInstance, DecodeSessionOption, DecodeSessionOptionValue, ExportErrorCode,
-    RuntimeBridge, RuntimeError, VcdExportRequest,
+    DecodeSessionInstance, DecodeSessionOption, DecodeSessionOptionValue, DeviceHandle,
+    DslChannelSpec, DslExportRequest, ExportErrorCode, RuntimeBridge, RuntimeError,
+    VcdExportRequest,
 };
 
 fn runtime_test_guard() -> &'static Mutex<()> {
@@ -802,4 +803,310 @@ fn temp_promotion_failures_reference_temp_and_final_vcd_paths() {
         }
         other => panic!("expected temp promote failure, got {other:?}"),
     }
+}
+
+struct VirtualSessionGuard<'a> {
+    runtime: &'a RuntimeBridge,
+    handle: Option<DeviceHandle>,
+    opened: bool,
+    callbacks: bool,
+    initialized: bool,
+}
+
+impl<'a> VirtualSessionGuard<'a> {
+    fn new(runtime: &'a RuntimeBridge) -> Self {
+        Self {
+            runtime,
+            handle: None,
+            opened: false,
+            callbacks: false,
+            initialized: false,
+        }
+    }
+}
+
+impl Drop for VirtualSessionGuard<'_> {
+    fn drop(&mut self) {
+        if self.callbacks {
+            let _ = self.runtime.clear_acquisition_callbacks();
+        }
+        if self.opened {
+            let _ = self.runtime.release_device();
+        }
+        if let Some(handle) = self.handle {
+            let _ = self.runtime.remove_device(handle);
+        }
+        if self.initialized {
+            let _ = self.runtime.exit();
+        }
+    }
+}
+
+fn read_zip_entry_names(zip_bytes: &[u8]) -> Vec<String> {
+    let eocd_sig = [0x50_u8, 0x4b, 0x05, 0x06];
+    let eocd_offset = zip_bytes
+        .windows(4)
+        .rposition(|window| window == eocd_sig)
+        .expect("ZIP archive should contain End of Central Directory record");
+    let cd_size = u32::from_le_bytes(zip_bytes[eocd_offset + 12..eocd_offset + 16].try_into().unwrap()) as usize;
+    let cd_offset = u32::from_le_bytes(zip_bytes[eocd_offset + 16..eocd_offset + 20].try_into().unwrap()) as usize;
+    let total_entries = u16::from_le_bytes(zip_bytes[eocd_offset + 10..eocd_offset + 12].try_into().unwrap()) as usize;
+
+    let mut pos = cd_offset;
+    let cd_end = cd_offset + cd_size;
+    let mut names = Vec::with_capacity(total_entries);
+    while pos < cd_end {
+        assert_eq!(&zip_bytes[pos..pos + 4], &[0x50, 0x4b, 0x01, 0x02]);
+        let name_len = u16::from_le_bytes(zip_bytes[pos + 28..pos + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(zip_bytes[pos + 30..pos + 32].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(zip_bytes[pos + 32..pos + 34].try_into().unwrap()) as usize;
+        let name_start = pos + 46;
+        let name = String::from_utf8(zip_bytes[name_start..name_start + name_len].to_vec())
+            .expect("ZIP entry name should be UTF-8");
+        names.push(name);
+        pos = name_start + name_len + extra_len + comment_len;
+    }
+    assert_eq!(names.len(), total_entries);
+    names
+}
+
+fn replay_dsl_through_virtual_session(
+    runtime: &RuntimeBridge,
+    dsl_path: &Path,
+    enabled_channels: Vec<u16>,
+) -> (u64, u64, u64, String) {
+    let mut guard = VirtualSessionGuard::new(runtime);
+    runtime.init().expect("runtime init should succeed");
+    guard.initialized = true;
+
+    runtime
+        .device_from_file(dsl_path)
+        .expect("ds_device_from_file should load generated .dsl");
+
+    let file_stem = dsl_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("dsl path should have filename");
+    let devices = runtime.list_devices().expect("device list should succeed");
+    let dev = devices
+        .iter()
+        .find(|device| device.name.contains(file_stem) || device.name.contains(".dsl"))
+        .unwrap_or_else(|| {
+            panic!("expected virtual-session device for {file_stem}, got {devices:?}")
+        });
+    guard.handle = Some(dev.handle);
+
+    runtime.open_device(dev.handle).expect("opening virtual-session should succeed");
+    guard.opened = true;
+
+    let current_samplerate_hz = runtime
+        .current_samplerate()
+        .expect("virtual-session current_samplerate should read cleanly")
+        .expect("virtual-session current_samplerate should be present");
+    let current_sample_limit = runtime
+        .current_sample_limit()
+        .expect("virtual-session current_sample_limit should read cleanly")
+        .expect("virtual-session current_sample_limit should be present");
+
+    runtime
+        .reset_acquisition_summary()
+        .expect("reset summary should succeed");
+    runtime
+        .register_acquisition_callbacks()
+        .expect("register acquisition callbacks should succeed");
+    guard.callbacks = true;
+    runtime
+        .start_collect()
+        .expect("virtual-session start_collect should succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state = runtime
+            .acquisition_state()
+            .expect("acquisition state should succeed");
+        if !state.is_collecting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "virtual-session replay timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let recorded_samples = runtime
+        .recorded_stream_sample_count()
+        .expect("recorded_stream_sample_count should succeed");
+    let vcd = runtime
+        .export_recorded_vcd(&VcdExportRequest {
+            samplerate_hz: current_samplerate_hz,
+            enabled_channels,
+        })
+        .expect("export_recorded_vcd after virtual-session replay should succeed");
+    assert_eq!(vcd.sample_count, recorded_samples);
+
+    (
+        current_samplerate_hz,
+        current_sample_limit,
+        recorded_samples,
+        normalize_vcd(&vcd_string(&vcd.bytes)),
+    )
+}
+
+#[test]
+fn dsl_cross_logic_packet_export_and_virtual_session_roundtrip() {
+    if skip_windows_vcd_goldens() {
+        return;
+    }
+    let _guard = runtime_test_guard().lock().unwrap();
+    let Some(runtime) = load_runtime() else {
+        return;
+    };
+
+    let ch0 = [0x0000_FFFF_0000_FFFF_u64, 0xF0F0_F0F0_0F0F_0F0F_u64];
+    let ch1 = [0xAAAA_AAAA_5555_5555_u64, 0xCCCC_3333_CCCC_3333_u64];
+    let ch2 = [0x1234_5678_9ABC_DEF0_u64, 0x0FED_CBA9_8765_4321_u64];
+    let cross_bytes = pack_cross_logic_blocks(&[&ch0, &ch1, &ch2]);
+    let packet_lengths = [24_usize, 24_usize];
+
+    let dsl_path = temp_path("cross-roundtrip").with_extension("dsl");
+    let _ = fs::remove_file(&dsl_path);
+
+    let dsl_request = DslExportRequest {
+        samplerate_hz: 8_000_000,
+        channels: vec![
+            DslChannelSpec {
+                index: 0,
+                name: "CLK".to_string(),
+            },
+            DslChannelSpec {
+                index: 2,
+                name: "MOSI".to_string(),
+            },
+            DslChannelSpec {
+                index: 5,
+                name: "CS#".to_string(),
+            },
+        ],
+        driver_name: "DSLogic Plus".to_string(),
+        trigger_time_ms: 1731552000123,
+        trigger_pos: 17,
+        session_json: "{\"Version\":3,\"Device\":\"DSLogic Plus\",\"DeviceMode\":0,\"Sample count\":\"128\",\"Sample rate\":\"8000000\",\"Operation Mode\":\"Buffer Mode\",\"decoder\":[],\"channel\":[]}".to_string(),
+        decoders_json: "[]".to_string(),
+    };
+
+    let facts = runtime
+        .render_dsl_from_cross_logic_packets_to_path(
+            &dsl_request,
+            &cross_bytes,
+            &packet_lengths,
+            &dsl_path,
+        )
+        .expect("cross-logic .dsl export should succeed");
+    assert_eq!(facts.sample_count, 128);
+    assert_eq!(facts.packet_count, 4);
+    assert!(facts.output_bytes > 0);
+    assert!(dsl_path.exists());
+    assert!(!dsl_path.with_extension("dsl.tmp").exists());
+
+    let zip_bytes = fs::read(&dsl_path).expect(".dsl file should be readable");
+    let entry_names = read_zip_entry_names(&zip_bytes);
+    assert_eq!(
+        entry_names,
+        vec![
+            "L-0/0".to_string(),
+            "L-2/0".to_string(),
+            "L-5/0".to_string(),
+            "header".to_string(),
+            "decoders".to_string(),
+            "session".to_string(),
+        ]
+    );
+
+    let expected_vcd = runtime
+        .render_vcd_from_cross_logic_packets(
+            &VcdExportRequest {
+                samplerate_hz: 8_000_000,
+                enabled_channels: vec![0, 2, 5],
+            },
+            &cross_bytes,
+            &packet_lengths,
+        )
+        .expect("direct VCD render should succeed");
+
+    let (current_samplerate_hz, current_sample_limit, replayed_samples, replayed_vcd) =
+        replay_dsl_through_virtual_session(&runtime, &dsl_path, vec![0, 2, 5]);
+    assert_eq!(current_samplerate_hz, 8_000_000);
+    assert_eq!(current_sample_limit, 128);
+    assert_eq!(replayed_samples, 128);
+    assert_eq!(replayed_vcd, normalize_vcd(&vcd_string(&expected_vcd.bytes)));
+
+    let _ = fs::remove_file(&dsl_path);
+}
+
+#[test]
+fn dsl_multi_block_split_export_roundtrips_above_16m_samples_and_non_metric_rate() {
+    if skip_windows_vcd_goldens() {
+        return;
+    }
+    let _guard = runtime_test_guard().lock().unwrap();
+    let Some(runtime) = load_runtime() else {
+        return;
+    };
+
+    const ONE_BLOCK_SAMPLES: usize = 16_777_216;
+    const TOTAL_SAMPLES: usize = ONE_BLOCK_SAMPLES + 128;
+    let mut sample_bytes = vec![0_u8; TOTAL_SAMPLES];
+    sample_bytes[1] = 1;
+    sample_bytes[ONE_BLOCK_SAMPLES] = 1;
+    sample_bytes[TOTAL_SAMPLES - 1] = 1;
+    let packet_lengths = [ONE_BLOCK_SAMPLES, 128_usize];
+
+    let dsl_path = temp_path("multiblock").with_extension("dsl");
+    let _ = fs::remove_file(&dsl_path);
+
+    let dsl_request = DslExportRequest {
+        samplerate_hz: 125_500,
+        channels: vec![DslChannelSpec {
+            index: 0,
+            name: "D0".to_string(),
+        }],
+        driver_name: "DSLogic Plus".to_string(),
+        trigger_time_ms: 0,
+        trigger_pos: 0,
+        session_json: "{\"Version\":3}".to_string(),
+        decoders_json: "[]".to_string(),
+    };
+
+    let facts = runtime
+        .render_dsl_from_logic_packets_to_path(
+            &dsl_request,
+            &sample_bytes,
+            &packet_lengths,
+            1,
+            &dsl_path,
+        )
+        .expect("multi-block .dsl export should succeed");
+    assert_eq!(facts.sample_count, TOTAL_SAMPLES as u64);
+
+    let zip_bytes = fs::read(&dsl_path).expect(".dsl file should be readable");
+    let entry_names = read_zip_entry_names(&zip_bytes);
+    assert_eq!(
+        entry_names,
+        vec![
+            "L-0/0".to_string(),
+            "L-0/1".to_string(),
+            "header".to_string(),
+            "decoders".to_string(),
+            "session".to_string(),
+        ]
+    );
+
+    let (current_samplerate_hz, current_sample_limit, replayed_samples, _replayed_vcd) =
+        replay_dsl_through_virtual_session(&runtime, &dsl_path, vec![0]);
+    assert_eq!(current_samplerate_hz, 125_500);
+    assert_eq!(current_sample_limit, TOTAL_SAMPLES as u64);
+    assert_eq!(replayed_samples, TOTAL_SAMPLES as u64);
+
+    let _ = fs::remove_file(&dsl_path);
 }

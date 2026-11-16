@@ -141,6 +141,8 @@ This captures 2048 samples at 100 MHz from channels 0-3 and writes:
 - `capture.vcd` - waveform data in Value Change Dump format.
 - `capture.json` - metadata sidecar with capture settings, completion state, and artifact paths.
 
+To save a DSView GUI session archive (`.dsl`) directly, pass `--output capture.dsl`, use `--dsl-output capture.dsl`, or pass both `--output capture.vcd --dsl-output capture.dsl`.
+
 Optional capture overrides use the same tokens reported by `devices options`:
 
 ```bash
@@ -301,7 +303,7 @@ dsview-cli devices options --handle HANDLE [--format json|text] [--resource-dir 
 
 ### `capture`
 
-Run a bounded capture and export a VCD file.
+Run a bounded capture and export `.vcd` and/or `.dsl` artifacts.
 
 ```bash
 dsview-cli capture \
@@ -309,7 +311,8 @@ dsview-cli capture \
   --sample-rate-hz HZ \
   --sample-limit SAMPLES \
   --channels IDX[,IDX...] \
-  --output PATH.vcd \
+  [--output PATH.vcd|PATH.dsl] \
+  [--dsl-output PATH.dsl] \
   [--metadata-output PATH.json] \
   [--operation-mode TOKEN] \
   [--stop-option TOKEN] \

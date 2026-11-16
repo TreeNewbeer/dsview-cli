@@ -46,6 +46,7 @@ fn clean_capture() -> CaptureRunSummary {
         },
         effective_device_options: None,
         streamed_vcd: None,
+        streamed_dsl: None,
         trigger: None,
     }
 }
@@ -195,7 +196,8 @@ fn export_request(completion: CaptureCompletion) -> CaptureExportRequest {
     CaptureExportRequest {
         capture,
         validated_config: validated_config(),
-        vcd_path: PathBuf::from("/tmp/capture.vcd"),
+        vcd_path: Some(PathBuf::from("/tmp/capture.vcd")),
+        dsl_path: None,
         metadata_path: None,
         tool_name: "dsview-cli".to_string(),
         tool_version: "1.2.4".to_string(),
@@ -300,7 +302,8 @@ fn conflicting_artifact_paths_are_rejected_before_export() {
 #[test]
 fn metadata_sidecar_schema_uses_numeric_capture_fields_and_utc_timestamp() {
     let request = export_request(CaptureCompletion::CleanSuccess);
-    let metadata_path = metadata_path_for_vcd(&request.vcd_path);
+    let vcd_path = request.vcd_path.as_ref().unwrap();
+    let metadata_path = metadata_path_for_vcd(vcd_path);
     let export = VcdExportFacts {
         sample_count: 1536,
         packet_count: 4,
@@ -331,7 +334,8 @@ fn metadata_sidecar_schema_uses_numeric_capture_fields_and_utc_timestamp() {
                 end_packet_status: Some("ok".to_string()),
             },
             artifacts: dsview_core::MetadataArtifactInfo {
-                vcd_path: request.vcd_path.display().to_string(),
+                vcd_path: Some(vcd_path.display().to_string()),
+                dsl_path: None,
                 metadata_path: metadata_path.display().to_string(),
             },
             device_options: CaptureDeviceOptionFacts {
@@ -432,7 +436,8 @@ fn metadata_schema_version_is_2_when_device_option_facts_are_present() {
             end_packet_status: Some("ok".to_string()),
         },
         artifacts: dsview_core::MetadataArtifactInfo {
-            vcd_path: "/tmp/capture.vcd".to_string(),
+            vcd_path: Some("/tmp/capture.vcd".to_string()),
+            dsl_path: None,
             metadata_path: "/tmp/capture.json".to_string(),
         },
         device_options: build_capture_device_option_facts(&export_request(CaptureCompletion::CleanSuccess))
